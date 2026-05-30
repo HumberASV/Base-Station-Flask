@@ -1,0 +1,3 @@
+[submodule "ros2_nodes/src/zed-ros-interfaces"]
+	path = ros2_nodes/src/zed-ros-interfaces
+	url = https://github.com/stereolabs/zed-ros-interfaces

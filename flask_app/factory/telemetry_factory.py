@@ -15,8 +15,6 @@ def make_default_state() -> dict:
         "map": {
             "occupancyGrid": [],
             "navigationGrid": [],
-            "fineGrid": [],
-            "courseTrail": [],
         },
         "planning": {
             "status": "standby",
@@ -42,7 +40,5 @@ def make_default_state() -> dict:
             "heading": 0.0,
             "longitude": 0.0,
             "latitude": 0.0,
-        },
-        "signal": {"strength": 0.0},
-        "video": {"streamUrl": ""},
+        }
     }

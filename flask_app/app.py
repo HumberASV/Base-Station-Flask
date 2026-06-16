@@ -10,7 +10,7 @@ from flask_login import LoginManager, UserMixin, login_required, login_user, log
 from flask_sqlalchemy import SQLAlchemy
 from flask_sock import Sock
 
-import telemetry_factory
+from factory import telemetry_factory
 import ros2_bridge
 
 logging.basicConfig(level=logging.INFO)

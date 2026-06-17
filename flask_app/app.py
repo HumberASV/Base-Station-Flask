@@ -5,7 +5,7 @@ import os
 import threading
 import time
 
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, render_template, request, jsonify, Response
 from flask_login import LoginManager, UserMixin, login_required, login_user, logout_user
 from flask_sqlalchemy import SQLAlchemy
 from flask_sock import Sock
@@ -34,6 +34,9 @@ _telemetry_state: dict = telemetry_factory.make_default_state()
 
 # Start the ROS2 bridge (no-op when ROS2 is not installed)
 ros2_bridge.start(_telemetry_state, _state_lock)
+
+# Inject the video stream path so the WebSocket payload always includes it.
+_telemetry_state["video"] = {"streamUrl": "/video_feed"}
 
 
 # ---------------------------------------------------------------------------
@@ -84,6 +87,28 @@ def telemetry_ws(ws):
             time.sleep(0.1)
     except Exception:
         pass  # client disconnected
+
+
+# ---------------------------------------------------------------------------
+# MJPEG video feed — served from the frame buffer populated by ros2_bridge
+# (raw frames) or annotated_udp_stream (annotated frames, takes priority).
+# ---------------------------------------------------------------------------
+
+@app.route("/video_feed")
+def video_feed():
+    def generate():
+        while True:
+            frame = ros2_bridge.get_latest_frame()
+            if frame is not None:
+                yield (
+                    b"--frame\r\n"
+                    b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
+                )
+            time.sleep(0.033)  # cap at ~30 fps
+
+    r = Response(generate(), mimetype="multipart/x-mixed-replace; boundary=frame")
+    r.headers["Access-Control-Allow-Origin"] = "*"
+    return r
 
 
 # ---------------------------------------------------------------------------

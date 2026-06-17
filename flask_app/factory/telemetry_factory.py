@@ -5,6 +5,21 @@ Provides the initial/fallback Status payload that matches the web client's
 Status type (statusTypes.ts). Used when ROS2 topics are unavailable.
 """
 
+logs = [
+    "Canadians call their 2 dollar coin a toonie",
+    "Terry Fox is a hero",
+    "Maple Syrup is great",
+    "Eh?",
+    "Canadians do not like to be called Americans",
+    "Yes, we measure height in feet and drive km/h"
+    "Canada manufactors lots of cars",
+    "Canada is a great trade partner",
+    "Canada has the largest undefended land border with the USA",
+    "Canada shares a land border with Denmark",
+    "We even sell maple syrup at the dollar store",
+    "We have two seasons: winter and construction",
+    "Canadians sometimes say sorry when they are not at fault"
+]
 
 def make_default_state() -> dict:
     """
@@ -40,5 +55,21 @@ def make_default_state() -> dict:
             "heading": 0.0,
             "longitude": 0.0,
             "latitude": 0.0,
-        }
+        },
+        "signal": {
+            "strength": 0.0,
+        },
+        "zed": {
+            "odom": {
+                "position": {"x": 0.0, "y": 0.0, "z": 0.0},
+                "orientation": {"roll": 0.0, "pitch": 0.0, "yaw": 0.0},
+            },
+            "objects": [],
+            "camera": {
+                "active": False,
+                "width": 0,
+                "height": 0,
+                "encoding": "",
+            },
+        },
     }

@@ -4,6 +4,7 @@ Default telemetry state factory.
 Provides the initial/fallback Status payload that matches the web client's
 Status type (statusTypes.ts). Used when ROS2 topics are unavailable.
 """
+import random
 
 logs = [
     "Canadians call their 2 dollar coin a toonie",
@@ -11,7 +12,7 @@ logs = [
     "Maple Syrup is great",
     "Eh?",
     "Canadians do not like to be called Americans",
-    "Yes, we measure height in feet and drive km/h"
+    "Yes, we measure height in feet and drive km/h",
     "Canada manufactors lots of cars",
     "Canada is a great trade partner",
     "Canada has the largest undefended land border with the USA",
@@ -37,7 +38,7 @@ def make_default_state() -> dict:
             "plan": [],
         },
         "task": {
-            "log": ["Base station started — awaiting ASV connection."],
+            "log": random.choice(logs),
             "location": {"latitude": 0.0, "longitude": 0.0},
             "data": {
                 "id": 0,

@@ -20,6 +20,7 @@ start and the app keeps serving factory defaults.
 
 import logging
 import math
+import os
 import threading
 import time
 
@@ -64,7 +65,15 @@ except ImportError:
 # and overwritten by annotated_udp_stream when it is also running.
 # Flask's /video_feed route reads from here.
 # ---------------------------------------------------------------------------
-_latest_frame: bytes | None = None
+_SAD_FRAME: bytes | None = None
+_sad_path = os.path.join(os.path.dirname(__file__), "images", "sad.jpg")
+try:
+    with open(_sad_path, "rb") as _f:
+        _SAD_FRAME = _f.read()
+except OSError:
+    log.warning("Could not load fallback image: %s", _sad_path)
+
+_latest_frame: bytes | None = _SAD_FRAME
 _frame_lock = threading.Lock()
 
 
@@ -340,6 +349,8 @@ class _BaseStationNode(Node):
                 self._state["zed"]["camera"]["active"] = False
                 _append_log(log_list, "WARNING: ZED camera feed lost.")
                 self._last_zed_image = now
+                if _SAD_FRAME is not None:
+                    set_latest_frame(_SAD_FRAME)
 
 
 # ----------------------------------------------------------------------

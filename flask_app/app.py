@@ -96,6 +96,11 @@ def telemetry_ws(ws):
 # (raw frames) or annotated_udp_stream (annotated frames, takes priority).
 # ---------------------------------------------------------------------------
 
+@app.route("/video_status")
+def video_status():
+    return jsonify(ros2_bridge.get_status())
+
+
 @app.route("/video_feed")
 def video_feed():
     def generate():

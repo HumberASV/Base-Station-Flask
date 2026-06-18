@@ -37,6 +37,13 @@ try:
 except (ImportError, AttributeError):
     _CVBRIDGE_OK = False
 
+try:
+    import io as _io
+    from PIL import Image as _PILImage
+    _PIL_OK = True
+except ImportError:
+    _PIL_OK = False
+
 log = logging.getLogger(__name__)
 
 try:
@@ -80,9 +87,10 @@ except OSError:
 
 _latest_frame: bytes | None = _SAD_FRAME
 _frame_lock = threading.Lock()
+_frames_received: int = 0  # incremented each time _on_zed_image fires
 
-log.info("ros2_bridge: cv2=%s cv_bridge=%s ros2=%s sad_frame=%s",
-         _CV2_OK, _CVBRIDGE_OK, _ROS2_AVAILABLE, _SAD_FRAME is not None)
+log.info("ros2_bridge ready  cv2=%s  cv_bridge=%s  pil=%s  ros2=%s  sad_frame=%s",
+         _CV2_OK, _CVBRIDGE_OK, _PIL_OK, _ROS2_AVAILABLE, _SAD_FRAME is not None)
 
 
 def set_latest_frame(jpeg: bytes) -> None:
@@ -96,10 +104,25 @@ def get_latest_frame() -> bytes | None:
         return _latest_frame
 
 
+def get_status() -> dict:
+    with _frame_lock:
+        frame = _latest_frame
+    return {
+        "cv2": _CV2_OK,
+        "cv_bridge": _CVBRIDGE_OK,
+        "pil": _PIL_OK,
+        "ros2": _ROS2_AVAILABLE,
+        "sad_frame_loaded": _SAD_FRAME is not None,
+        "frames_received": _frames_received,
+        "showing_sad": frame == _SAD_FRAME,
+        "frame_bytes": len(frame) if frame else 0,
+    }
+
+
 PHONE_TOPIC = "Phone"
 TASK_TOPIC = "Task"
 ZED_ODOM_TOPIC = "zed/zed_node/odom"
-ZED_IMAGE_TOPIC = "zed/zed_node/rgb/color/rect/image"
+ZED_IMAGE_TOPIC = "/zed/zed_node/rgb/color/rect/image"
 ZED_OBJECTS_TOPIC = "zed/obj_det/objects"
 ROSOUT_TOPIC = "/rosout"
 
@@ -136,6 +159,16 @@ def _append_log(log_list: list, entry: str) -> None:
         log_list.append(entry)
     if len(log_list) > _LOG_MAX:
         del log_list[:-_LOG_MAX]
+
+def _to_bgr_cv2(frame: "np.ndarray", enc: str) -> "np.ndarray":
+    if enc in ('bgra8', 'bgra'):
+        return cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+    if enc in ('rgba8', 'rgba'):
+        return cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
+    if enc in ('rgb8', 'rgb'):
+        return cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+    return frame  # already bgr8
+
 
 def _draw_ros_objects(frame: "np.ndarray", objects: list) -> None:
     """Draw 2D bounding boxes from raw ZED ROS2 objects onto frame in-place."""
@@ -272,7 +305,10 @@ class _BaseStationNode(Node):
     # ZED: RGB image  (sensor_msgs/Image) — stores metadata + produces JPEG
     # ------------------------------------------------------------------
     def _on_zed_image(self, msg):
-        log.info("[ZED/image] %dx%d enc=%s", msg.width, msg.height, msg.encoding)
+        global _frames_received
+        _frames_received += 1
+        log.info("[ZED/image] #%d  %dx%d  enc=%s", _frames_received, msg.width, msg.height, msg.encoding)
+
         with self._lock:
             cam = self._state["zed"]["camera"]
             cam["active"] = True
@@ -281,39 +317,68 @@ class _BaseStationNode(Node):
             cam["encoding"] = msg.encoding
         self._last_zed_image = time.monotonic()
 
-        if not _CV2_OK:
-            log.warning("[ZED/image] cv2/numpy not available — skipping frame encode")
-            return
-        try:
-            if self._bridge:
-                # passthrough: no colour conversion by cv_bridge; we do it below
+        jpeg = self._encode_jpeg(msg)
+        if jpeg is not None:
+            set_latest_frame(jpeg)
+            log.debug("[ZED/image] buffered %d bytes", len(jpeg))
+        else:
+            log.warning("[ZED/image] all encode paths failed — frame dropped")
+
+    def _encode_jpeg(self, msg) -> "bytes | None":
+        enc = msg.encoding.lower()
+
+        # ── Path 1: cv_bridge + cv2 ──────────────────────────────────────
+        if _CV2_OK and self._bridge:
+            try:
                 frame = self._bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
-            else:
-                # cv_bridge unavailable — decode raw bytes directly with numpy
+                frame = _to_bgr_cv2(frame, enc)
+                with self._raw_objects_lock:
+                    _draw_ros_objects(frame, list(self._raw_objects))
+                ok, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                if ok:
+                    return buf.tobytes()
+                log.warning("[ZED/image] cv_bridge path: imencode failed")
+            except Exception as exc:
+                log.warning("[ZED/image] cv_bridge path failed: %s", exc, exc_info=True)
+
+        # ── Path 2: numpy + cv2 (no cv_bridge) ───────────────────────────
+        if _CV2_OK:
+            try:
                 raw = np.frombuffer(bytes(msg.data), dtype=np.uint8)
                 n_ch = msg.step // msg.width
                 frame = raw.reshape((msg.height, msg.width, n_ch))
+                frame = _to_bgr_cv2(frame, enc)
+                ok, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                if ok:
+                    return buf.tobytes()
+                log.warning("[ZED/image] numpy path: imencode failed")
+            except Exception as exc:
+                log.warning("[ZED/image] numpy path failed: %s", exc, exc_info=True)
 
-            enc = msg.encoding.lower()
-            if enc in ('bgra8', 'bgra'):
-                frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
-            elif enc in ('rgba8', 'rgba'):
-                frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
-            elif enc in ('rgb8', 'rgb'):
-                frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-            # bgr8 needs no conversion
+        # ── Path 3: PIL (no cv2 at all) ───────────────────────────────────
+        if _PIL_OK:
+            try:
+                raw = bytes(msg.data)
+                if enc in ('bgra8', 'bgra'):
+                    img = _PILImage.frombuffer('RGBA', (msg.width, msg.height), raw, 'raw', 'BGRA', 0, 1).convert('RGB')
+                elif enc in ('rgba8', 'rgba'):
+                    img = _PILImage.frombuffer('RGBA', (msg.width, msg.height), raw, 'raw', 'RGBA', 0, 1).convert('RGB')
+                elif enc in ('bgr8', 'bgr'):
+                    img = _PILImage.frombuffer('RGB', (msg.width, msg.height), raw, 'raw', 'BGR', 0, 1)
+                elif enc in ('rgb8', 'rgb'):
+                    img = _PILImage.frombuffer('RGB', (msg.width, msg.height), raw, 'raw', 'RGB', 0, 1)
+                else:
+                    log.warning("[ZED/image] PIL: unsupported encoding %s", msg.encoding)
+                    return None
+                buf = _io.BytesIO()
+                img.save(buf, format='JPEG', quality=80)
+                return buf.getvalue()
+            except Exception as exc:
+                log.warning("[ZED/image] PIL path failed: %s", exc, exc_info=True)
 
-            with self._raw_objects_lock:
-                raw_objs = list(self._raw_objects)
-            _draw_ros_objects(frame, raw_objs)
-            ok, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-            if ok:
-                set_latest_frame(buf.tobytes())
-                log.debug("[ZED/image] frame encoded and buffered (%d bytes)", len(buf))
-            else:
-                log.warning("[ZED/image] JPEG encode returned false")
-        except Exception as exc:
-            log.warning("[ZED/image] frame decode error: %s", exc, exc_info=True)
+        log.warning("[ZED/image] no encoder available  cv2=%s  cv_bridge=%s  pil=%s",
+                    _CV2_OK, _CVBRIDGE_OK, _PIL_OK)
+        return None
 
     # ------------------------------------------------------------------
     # ZED: object detection  (zed_msgs/ObjectsStamped)

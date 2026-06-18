@@ -222,7 +222,7 @@ class _AnnotatedStreamNode(Node):
 def main():
     ap = argparse.ArgumentParser(description='ZED annotated UDP stream')
     ap.add_argument('--port', type=int, default=9999)
-    ap.add_argument('--image-topic', default='zed/zed_node/rgb/color/rect/image')
+    ap.add_argument('--image-topic', default='/zed/zed_node/rgb/color/rect/image')
     ap.add_argument('--objects-topic', default='zed/obj_det/objects')
     ap.add_argument('--quality', type=int, default=80, metavar='1-100')
     args = ap.parse_args()

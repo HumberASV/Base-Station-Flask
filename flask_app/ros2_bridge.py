@@ -27,10 +27,15 @@ import time
 try:
     import cv2
     import numpy as np
-    from cv_bridge import CvBridge
     _CV2_OK = True
-except (ImportError, AttributeError):
+except ImportError:
     _CV2_OK = False
+
+try:
+    from cv_bridge import CvBridge
+    _CVBRIDGE_OK = True
+except (ImportError, AttributeError):
+    _CVBRIDGE_OK = False
 
 log = logging.getLogger(__name__)
 
@@ -75,6 +80,9 @@ except OSError:
 
 _latest_frame: bytes | None = _SAD_FRAME
 _frame_lock = threading.Lock()
+
+log.info("ros2_bridge: cv2=%s cv_bridge=%s ros2=%s sad_frame=%s",
+         _CV2_OK, _CVBRIDGE_OK, _ROS2_AVAILABLE, _SAD_FRAME is not None)
 
 
 def set_latest_frame(jpeg: bytes) -> None:
@@ -166,7 +174,8 @@ class _BaseStationNode(Node):
         self._last_zed_odom = 0.0
         self._last_zed_image = 0.0
         self._last_zed_objects = 0.0
-        self._bridge = CvBridge() if _CV2_OK else None
+        self._bridge = CvBridge() if (_CV2_OK and _CVBRIDGE_OK) else None
+        log.info("[ZED] cv2=%s cv_bridge=%s", _CV2_OK, _CVBRIDGE_OK)
         # Raw ROS2 ZED objects kept for annotation overlay (not serialized into state)
         self._raw_objects: list = []
         self._raw_objects_lock = threading.Lock()
@@ -263,7 +272,7 @@ class _BaseStationNode(Node):
     # ZED: RGB image  (sensor_msgs/Image) — stores metadata + produces JPEG
     # ------------------------------------------------------------------
     def _on_zed_image(self, msg):
-        log.debug("[ZED/image] %dx%d enc=%s", msg.width, msg.height, msg.encoding)
+        log.info("[ZED/image] %dx%d enc=%s", msg.width, msg.height, msg.encoding)
         with self._lock:
             cam = self._state["zed"]["camera"]
             cam["active"] = True
@@ -273,16 +282,17 @@ class _BaseStationNode(Node):
         self._last_zed_image = time.monotonic()
 
         if not _CV2_OK:
+            log.warning("[ZED/image] cv2/numpy not available — skipping frame encode")
             return
         try:
             if self._bridge:
-                # Use passthrough so cv_bridge never tries a colour-space conversion;
-                # we handle bgra8 / rgba8 → bgr8 ourselves below.
+                # passthrough: no colour conversion by cv_bridge; we do it below
                 frame = self._bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
             else:
+                # cv_bridge unavailable — decode raw bytes directly with numpy
                 raw = np.frombuffer(bytes(msg.data), dtype=np.uint8)
-                channels = len(msg.data) // (msg.height * msg.width)
-                frame = raw.reshape((msg.height, msg.width, channels))
+                n_ch = msg.step // msg.width
+                frame = raw.reshape((msg.height, msg.width, n_ch))
 
             enc = msg.encoding.lower()
             if enc in ('bgra8', 'bgra'):
@@ -299,10 +309,11 @@ class _BaseStationNode(Node):
             ok, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
             if ok:
                 set_latest_frame(buf.tobytes())
+                log.debug("[ZED/image] frame encoded and buffered (%d bytes)", len(buf))
             else:
                 log.warning("[ZED/image] JPEG encode returned false")
         except Exception as exc:
-            log.warning("[ZED/image] frame decode error: %s", exc)
+            log.warning("[ZED/image] frame decode error: %s", exc, exc_info=True)
 
     # ------------------------------------------------------------------
     # ZED: object detection  (zed_msgs/ObjectsStamped)

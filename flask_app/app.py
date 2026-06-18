@@ -170,4 +170,4 @@ def uh_oh():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080, threaded=True, debug=_debug)
+    app.run(host="0.0.0.0", port=8080, threaded=True, debug=_debug, use_reloader=False)

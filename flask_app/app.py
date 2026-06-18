@@ -13,12 +13,14 @@ from flask_sock import Sock
 from factory import telemetry_factory
 import ros2_bridge
 
-logging.basicConfig(level=logging.INFO)
+_debug = os.getenv("FLASK_DEBUG", "0") == "1"
+logging.basicConfig(level=logging.DEBUG if _debug else logging.INFO)
 
 app = Flask(__name__)
 app.secret_key = os.getenv("SECRET_KEY", "change-me-in-production")
 app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv("DATABASE_URL", "sqlite:///app.db")
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+app.config["DEBUG"] = _debug
 
 db = SQLAlchemy(app)
 sock = Sock(app)
@@ -168,4 +170,4 @@ def uh_oh():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080, threaded=True)
+    app.run(host="0.0.0.0", port=8080, threaded=True, debug=_debug)

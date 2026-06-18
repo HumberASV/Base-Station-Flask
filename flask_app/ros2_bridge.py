@@ -37,6 +37,7 @@ try:
     import rclpy
     from rclpy.node import Node
     from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSDurabilityPolicy
+    from rcl_interfaces.msg import Log as RosoutLog
     from std_msgs.msg import Float32MultiArray
     from nav_msgs.msg import Odometry
     from sensor_msgs.msg import Image
@@ -83,6 +84,7 @@ TASK_TOPIC = "Task"
 ZED_ODOM_TOPIC = "zed/zed_node/odom"
 ZED_IMAGE_TOPIC = "zed/zed_node/rgb/color/rect/image"
 ZED_OBJECTS_TOPIC = "zed/obj_det/objects"
+ROSOUT_TOPIC = "/rosout"
 
 _STALE_THRESHOLD_S = 5.0
 _LOG_MAX = 50
@@ -172,6 +174,7 @@ class _BaseStationNode(Node):
         self.create_subscription(Float32MultiArray, TASK_TOPIC, self._on_task, best_effort_qos)
         self.create_subscription(Odometry, ZED_ODOM_TOPIC, self._on_zed_odom, best_effort_qos)
         self.create_subscription(Image, ZED_IMAGE_TOPIC, self._on_zed_image, video_qos)
+        self.create_subscription(RosoutLog, ROSOUT_TOPIC, self._on_rosout, reliable_qos)
         if _ZED_MSGS_AVAILABLE:
             self.create_subscription(
                 ObjectsStamped, ZED_OBJECTS_TOPIC, self._on_zed_objects, reliable_qos
@@ -297,6 +300,20 @@ class _BaseStationNode(Node):
         with self._raw_objects_lock:
             self._raw_objects = list(msg.objects)
         self._last_zed_objects = time.monotonic()
+
+    # ------------------------------------------------------------------
+    # /rosout  (rcl_interfaces/Log) — system-wide ROS2 log stream
+    # ------------------------------------------------------------------
+    _ROSOUT_LEVEL = {10: "DEBUG", 20: "INFO", 30: "WARN", 40: "ERROR", 50: "FATAL"}
+
+    def _on_rosout(self, msg):
+        level = self._ROSOUT_LEVEL.get(msg.level, str(msg.level))
+        if msg.level < 20:  # skip DEBUG — too noisy
+            return
+        entry = f"[{level}] [{msg.name}]: {msg.msg}"
+        log.debug("[rosout] %s", entry)
+        with self._lock:
+            _append_log(self._state["log"], entry)
 
     # ------------------------------------------------------------------
     # Staleness check — called once per spin iteration

@@ -38,7 +38,7 @@ def make_default_state() -> dict:
             "plan": [],
         },
         "task": {
-            "log": random.choice(logs),
+            "log": [random.choice(logs)],
             "location": {"latitude": 0.0, "longitude": 0.0},
             "data": {
                 "id": 0,

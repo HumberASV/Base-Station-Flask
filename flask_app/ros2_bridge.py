@@ -191,6 +191,7 @@ class _BaseStationNode(Node):
         if len(d) < 4:
             return
         lat, lon, speed, heading = float(d[0]), float(d[1]), float(d[2]), float(d[3])
+        log.debug("[Phone] lat=%.6f lon=%.6f speed=%.3f heading=%.2f", lat, lon, speed, heading)
         with self._lock:
             s = self._state
             s["asv"]["latitude"] = lat
@@ -213,6 +214,7 @@ class _BaseStationNode(Node):
         target_heading = float(d[1])
         target_speed = float(d[2])
         status = _ACTION_TO_STATUS.get(action, "standby")
+        log.debug("[Task] action=%.0f status=%s heading=%.1f speed=%.3f", action, status, target_heading, target_speed)
         entry = (
             f"Task — action={action:.0f} "
             f"heading={target_heading:.1f}° "
@@ -232,6 +234,8 @@ class _BaseStationNode(Node):
         p = msg.pose.pose.position
         o = msg.pose.pose.orientation
         roll, pitch, yaw = _quat_to_rpy(o.x, o.y, o.z, o.w)
+        log.debug("[ZED/odom] pos=(%.3f, %.3f, %.3f) rpy=(%.1f°, %.1f°, %.1f°)",
+                  p.x, p.y, p.z, math.degrees(roll), math.degrees(pitch), math.degrees(yaw))
         with self._lock:
             zed = self._state["zed"]["odom"]
             zed["position"] = {"x": float(p.x), "y": float(p.y), "z": float(p.z)}
@@ -246,6 +250,7 @@ class _BaseStationNode(Node):
     # ZED: RGB image  (sensor_msgs/Image) — stores metadata + produces JPEG
     # ------------------------------------------------------------------
     def _on_zed_image(self, msg):
+        log.debug("[ZED/image] %dx%d enc=%s", msg.width, msg.height, msg.encoding)
         with self._lock:
             cam = self._state["zed"]["camera"]
             cam["active"] = True
@@ -271,6 +276,8 @@ class _BaseStationNode(Node):
     # ZED: object detection  (zed_msgs/ObjectsStamped)
     # ------------------------------------------------------------------
     def _on_zed_objects(self, msg):
+        log.debug("[ZED/objects] count=%d  %s", len(msg.objects),
+                  [(o.label, f"{o.confidence:.0f}%") for o in msg.objects])
         objects = [
             {
                 "label": obj.label,

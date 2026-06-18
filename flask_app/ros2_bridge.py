@@ -313,7 +313,7 @@ class _BaseStationNode(Node):
         entry = f"[{level}] [{msg.name}]: {msg.msg}"
         log.debug("[rosout] %s", entry)
         with self._lock:
-            _append_log(self._state["log"], entry)
+            _append_log(self._state["task"]["log"], entry)
 
     # ------------------------------------------------------------------
     # Staleness check — called once per spin iteration

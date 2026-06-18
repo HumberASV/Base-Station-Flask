@@ -80,8 +80,8 @@ def get_latest_frame() -> bytes | None:
 
 PHONE_TOPIC = "Phone"
 TASK_TOPIC = "Task"
-ZED_ODOM_TOPIC = "zed/odom"
-ZED_IMAGE_TOPIC = "zed/rgb/color/rect/image"
+ZED_ODOM_TOPIC = "zed/zed_node/odom"
+ZED_IMAGE_TOPIC = "zed/zed_node/rgb/color/rect/image"
 ZED_OBJECTS_TOPIC = "zed/obj_det/objects"
 
 _STALE_THRESHOLD_S = 5.0

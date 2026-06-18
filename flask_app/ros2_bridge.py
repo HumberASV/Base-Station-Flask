@@ -272,18 +272,37 @@ class _BaseStationNode(Node):
             cam["encoding"] = msg.encoding
         self._last_zed_image = time.monotonic()
 
-        if not (_CV2_OK and self._bridge):
+        if not _CV2_OK:
             return
         try:
-            frame = self._bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            if self._bridge:
+                # Use passthrough so cv_bridge never tries a colour-space conversion;
+                # we handle bgra8 / rgba8 → bgr8 ourselves below.
+                frame = self._bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
+            else:
+                raw = np.frombuffer(bytes(msg.data), dtype=np.uint8)
+                channels = len(msg.data) // (msg.height * msg.width)
+                frame = raw.reshape((msg.height, msg.width, channels))
+
+            enc = msg.encoding.lower()
+            if enc in ('bgra8', 'bgra'):
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+            elif enc in ('rgba8', 'rgba'):
+                frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
+            elif enc in ('rgb8', 'rgb'):
+                frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            # bgr8 needs no conversion
+
             with self._raw_objects_lock:
                 raw_objs = list(self._raw_objects)
             _draw_ros_objects(frame, raw_objs)
             ok, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
             if ok:
                 set_latest_frame(buf.tobytes())
+            else:
+                log.warning("[ZED/image] JPEG encode returned false")
         except Exception as exc:
-            log.debug("Frame encode error: %s", exc)
+            log.warning("[ZED/image] frame decode error: %s", exc)
 
     # ------------------------------------------------------------------
     # ZED: object detection  (zed_msgs/ObjectsStamped)

@@ -161,15 +161,16 @@ class _BaseStationNode(Node):
         self._raw_objects_lock = threading.Lock()
 
         reliable_qos = QoSProfile(depth=10)
-        video_qos = QoSProfile(
+        best_effort_qos = QoSProfile(
             depth=10,
             reliability=QoSReliabilityPolicy.BEST_EFFORT,
             durability=QoSDurabilityPolicy.VOLATILE,
         )
+        video_qos = best_effort_qos
 
-        self.create_subscription(Float32MultiArray, PHONE_TOPIC, self._on_phone, 10)
-        self.create_subscription(Float32MultiArray, TASK_TOPIC, self._on_task, 10)
-        self.create_subscription(Odometry, ZED_ODOM_TOPIC, self._on_zed_odom, reliable_qos)
+        self.create_subscription(Float32MultiArray, PHONE_TOPIC, self._on_phone, best_effort_qos)
+        self.create_subscription(Float32MultiArray, TASK_TOPIC, self._on_task, best_effort_qos)
+        self.create_subscription(Odometry, ZED_ODOM_TOPIC, self._on_zed_odom, best_effort_qos)
         self.create_subscription(Image, ZED_IMAGE_TOPIC, self._on_zed_image, video_qos)
         if _ZED_MSGS_AVAILABLE:
             self.create_subscription(

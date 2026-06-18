@@ -28,7 +28,7 @@ try:
     import numpy as np
     from cv_bridge import CvBridge
     _CV2_OK = True
-except ImportError:
+except (ImportError, AttributeError):
     _CV2_OK = False
 
 log = logging.getLogger(__name__)
@@ -333,8 +333,10 @@ def _spin_loop(state: dict, lock: threading.Lock) -> None:
         while rclpy.ok():
             rclpy.spin_once(node, timeout_sec=1.0)
             node.tick()
+    except KeyboardInterrupt:
+        pass
     except Exception as exc:
-        log.error("ROS2 spin error: %s", exc)
+        log.error("ROS2 spin error: %s: %s", type(exc).__name__, exc)
     finally:
         node.destroy_node()
         rclpy.shutdown()

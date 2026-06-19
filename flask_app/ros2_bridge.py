@@ -228,7 +228,12 @@ class _BaseStationNode(Node):
             reliability=QoSReliabilityPolicy.BEST_EFFORT,
             durability=QoSDurabilityPolicy.VOLATILE,
         )
-        video_qos = best_effort_qos
+        # ZED image publisher uses RELIABLE — match it so DDS negotiation always succeeds
+        video_qos = QoSProfile(
+            depth=1,
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.VOLATILE,
+        )
 
         self.create_subscription(Float32MultiArray, PHONE_TOPIC, self._on_phone, best_effort_qos)
         self.create_subscription(Float32MultiArray, TASK_TOPIC, self._on_task, best_effort_qos)
@@ -487,6 +492,16 @@ def _spin_loop(state: dict, lock: threading.Lock) -> None:
         _spin_running = False
         node.destroy_node()
         rclpy.shutdown()
+
+def streams_live() -> dict:
+    """Return whether telemetry and video streams are currently receiving data."""
+    with _frame_lock:
+        video_live = _latest_frame is not None and _latest_frame is not _SAD_FRAME
+    return {
+        "telemetry": _spin_running,
+        "video": video_live,
+    }
+
 
 def start(state: dict, lock: threading.Lock) -> "threading.Thread | None":
     """

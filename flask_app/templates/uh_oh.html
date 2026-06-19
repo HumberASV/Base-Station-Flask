@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Access Denied — Base Station</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: system-ui, sans-serif; background: #0f1117; color: #e0e0e0; display: flex; align-items: center; justify-content: center; min-height: 100vh; text-align: center; }
+        .card { background: #1a1d27; border: 1px solid #2d3147; border-radius: 8px; padding: 3rem 2.5rem; max-width: 420px; }
+        h1 { font-size: 2.5rem; margin-bottom: 0.75rem; }
+        p { color: #9ca3af; font-size: 0.95rem; line-height: 1.6; margin-bottom: 2rem; }
+        a { color: #7eb8f7; text-decoration: none; font-size: 0.9rem; }
+        a:hover { text-decoration: underline; }
+    </style>
+</head>
+<body>
+<div class="card">
+    <h1>Uh oh!</h1>
+    <p>{{ message }}</p>
+    <a href="/client">← Back to login</a>
+</div>
+</body>
+</html>

@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ASV Base Station</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: system-ui, sans-serif; background: #0f1117; color: #e0e0e0; }
+
+        /* ── Token input (unauthenticated) ──────────────────────────────── */
+        .login-wrap { display: flex; align-items: center; justify-content: center; min-height: 100vh; }
+        .login-card { background: #1a1d27; border: 1px solid #2d3147; border-radius: 8px; padding: 2rem; width: 360px; }
+        .login-card h1 { font-size: 1.2rem; color: #7eb8f7; margin-bottom: 0.5rem; }
+        .login-card p  { font-size: 0.85rem; color: #9ca3af; margin-bottom: 1.5rem; }
+        label { font-size: 0.78rem; color: #9ca3af; display: block; margin-bottom: 0.3rem; }
+        .token-input { width: 100%; background: #0f1117; border: 1px solid #2d3147; color: #e0e0e0; padding: 0.6rem 0.75rem; border-radius: 4px; font-size: 0.9rem; font-family: monospace; margin-bottom: 1rem; }
+        .token-input:focus { outline: 2px solid #7eb8f7; border-color: #7eb8f7; }
+        .btn-submit { width: 100%; background: #2563eb; color: #fff; border: none; padding: 0.65rem; border-radius: 4px; font-size: 0.9rem; font-weight: 500; cursor: pointer; }
+        .btn-submit:hover { background: #1d4ed8; }
+
+        /* ── Stream view (authenticated) ────────────────────────────────── */
+        header { background: #1a1d27; padding: 0.75rem 1.5rem; border-bottom: 1px solid #2d3147; display: flex; justify-content: space-between; align-items: center; }
+        header h1 { font-size: 1rem; color: #7eb8f7; }
+        .ws-indicator { display: flex; align-items: center; gap: 6px; font-size: 0.8rem; color: #9ca3af; }
+        .dot { width: 8px; height: 8px; border-radius: 50%; background: #ef4444; flex-shrink: 0; }
+        .dot.on { background: #22c55e; }
+
+        .layout { display: grid; grid-template-columns: 1fr 300px; gap: 1rem; padding: 1rem; height: calc(100vh - 52px); }
+        .video-panel { background: #000; border-radius: 6px; overflow: hidden; display: flex; align-items: center; justify-content: center; }
+        .video-panel img { max-width: 100%; max-height: 100%; object-fit: contain; }
+        .side-panel { display: flex; flex-direction: column; gap: 0.75rem; overflow-y: auto; }
+
+        .tele-card { background: #1a1d27; border: 1px solid #2d3147; border-radius: 6px; padding: 1rem; flex-shrink: 0; }
+        .tele-card h3 { font-size: 0.72rem; color: #6b7280; text-transform: uppercase; letter-spacing: 0.07em; margin-bottom: 0.6rem; }
+        .tele-row { display: flex; justify-content: space-between; font-size: 0.85rem; padding: 0.18rem 0; }
+        .val { color: #7eb8f7; font-family: monospace; }
+        .signal-bar { height: 4px; background: #2d3147; border-radius: 2px; margin-top: 0.6rem; }
+        .signal-fill { height: 100%; background: #22c55e; border-radius: 2px; transition: width 0.3s ease; }
+        .log-box { font-size: 0.73rem; font-family: monospace; max-height: 170px; overflow-y: auto; color: #9ca3af; }
+        .log-box div { padding: 0.12rem 0; border-bottom: 1px solid #1e2235; }
+    </style>
+</head>
+<body>
+
+{% if authorized %}
+<!-- ═══ Stream view ═══════════════════════════════════════════════════════ -->
+<header>
+    <h1>ASV Base Station</h1>
+    <div class="ws-indicator">
+        <div class="dot" id="dot"></div>
+        <span id="ws-label">Connecting…</span>
+    </div>
+</header>
+
+<div class="layout">
+    <div class="video-panel">
+        <img src="/video_feed" alt="Live video feed from ASV">
+    </div>
+
+    <div class="side-panel">
+        <div class="tele-card">
+            <h3>Signal</h3>
+            <div class="tele-row"><span>Strength</span><span class="val" id="sig">—</span></div>
+            <div class="signal-bar"><div class="signal-fill" id="sig-bar" style="width:0%"></div></div>
+        </div>
+
+        <div class="tele-card">
+            <h3>Position</h3>
+            <div class="tele-row"><span>Latitude</span> <span class="val" id="lat">—</span></div>
+            <div class="tele-row"><span>Longitude</span><span class="val" id="lon">—</span></div>
+            <div class="tele-row"><span>Speed</span>    <span class="val" id="spd">—</span></div>
+            <div class="tele-row"><span>Heading</span>  <span class="val" id="hdg">—</span></div>
+        </div>
+
+        <div class="tele-card">
+            <h3>Orientation</h3>
+            <div class="tele-row"><span>Roll</span> <span class="val" id="roll">—</span></div>
+            <div class="tele-row"><span>Pitch</span><span class="val" id="pitch">—</span></div>
+            <div class="tele-row"><span>Yaw</span>  <span class="val" id="yaw">—</span></div>
+        </div>
+
+        <div class="tele-card">
+            <h3>Mission</h3>
+            <div class="tele-row"><span>Status</span><span class="val" id="mission">—</span></div>
+        </div>
+
+        <div class="tele-card">
+            <h3>System Log</h3>
+            <div class="log-box" id="log"></div>
+        </div>
+    </div>
+</div>
+
+<script>
+const ws = new WebSocket(`ws://${location.host}/telemetry`);
+
+ws.onopen = () => {
+    document.getElementById('dot').classList.add('on');
+    document.getElementById('ws-label').textContent = 'Connected';
+};
+ws.onclose = () => {
+    document.getElementById('dot').classList.remove('on');
+    document.getElementById('ws-label').textContent = 'Disconnected';
+};
+ws.onerror = () => {
+    document.getElementById('ws-label').textContent = 'Error';
+};
+
+ws.onmessage = ({ data }) => {
+    let d;
+    try { d = JSON.parse(data); } catch { return; }
+
+    const sig = d?.signal?.strength ?? 0;
+    set('sig', sig.toFixed(1) + '%');
+    document.getElementById('sig-bar').style.width = Math.min(sig, 100) + '%';
+
+    const asv = d?.asv ?? {};
+    set('lat',  fmt6(asv.latitude));
+    set('lon',  fmt6(asv.longitude));
+    set('spd',  asv.speed   != null ? asv.speed.toFixed(2)   + ' m/s' : '—');
+    set('hdg',  asv.heading != null ? asv.heading.toFixed(1)  + '°'   : '—');
+
+    const ori = d?.zed?.odom?.orientation ?? {};
+    set('roll',  fmtDeg(ori.roll));
+    set('pitch', fmtDeg(ori.pitch));
+    set('yaw',   fmtDeg(ori.yaw));
+
+    set('mission', d?.planning?.status ?? '—');
+
+    const logs = d?.task?.log ?? [];
+    document.getElementById('log').innerHTML =
+        [...logs].reverse().map(l => `<div>${esc(l)}</div>`).join('');
+};
+
+function set(id, v) { document.getElementById(id).textContent = v; }
+function fmt6(v)    { return v != null ? Number(v).toFixed(6) : '—'; }
+function fmtDeg(v)  { return v != null ? Number(v).toFixed(1) + '°' : '—'; }
+function esc(s) {
+    return String(s).replace(/[&<>"']/g,
+        c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+</script>
+
+{% else %}
+<!-- ═══ Token input ═══════════════════════════════════════════════════════ -->
+<div class="login-wrap">
+    <div class="login-card">
+        <h1>ASV Base Station</h1>
+        <p>Enter your access token to view live telemetry and video.</p>
+        <form method="post" action="/client">
+            <label for="token">Access Token</label>
+            <input class="token-input" type="text" id="token" name="token"
+                   placeholder="Paste your token here" autocomplete="off" required>
+            <button class="btn-submit" type="submit">Access Stream</button>
+        </form>
+    </div>
+</div>
+{% endif %}
+
+</body>
+</html>

@@ -88,6 +88,9 @@ except OSError:
 _latest_frame: bytes | None = _SAD_FRAME
 _frame_lock = threading.Lock()
 _frames_received: int = 0  # incremented each time _on_zed_image fires
+_spin_running: bool = False
+_spin_error: str = ""
+_spin_started_at: float = 0.0
 
 log.info("ros2_bridge ready  cv2=%s  cv_bridge=%s  pil=%s  ros2=%s  sad_frame=%s",
          _CV2_OK, _CVBRIDGE_OK, _PIL_OK, _ROS2_AVAILABLE, _SAD_FRAME is not None)
@@ -116,6 +119,10 @@ def get_status() -> dict:
         "frames_received": _frames_received,
         "showing_sad": frame == _SAD_FRAME,
         "frame_bytes": len(frame) if frame else 0,
+        "spin_running": _spin_running,
+        "spin_error": _spin_error,
+        "spin_uptime_s": round(time.monotonic() - _spin_started_at, 1) if _spin_started_at else 0,
+        "image_topic": ZED_IMAGE_TOPIC,
     }
 
 
@@ -453,13 +460,18 @@ class _BaseStationNode(Node):
 # ----------------------------------------------------------------------
 
 def _spin_loop(state: dict, lock: threading.Lock) -> None:
+    global _spin_running, _spin_error, _spin_started_at
     try:
         rclpy.init()
     except Exception as exc:
-        log.error("rclpy.init() failed (%s) — ROS2 bridge disabled.", exc)
+        _spin_error = f"rclpy.init() failed: {exc}"
+        log.error(_spin_error)
         return
 
+    _spin_started_at = time.monotonic()
     node = _BaseStationNode(state, lock)
+    _spin_running = True
+    log.info("ROS2 spin loop running (topic=%s)", ZED_IMAGE_TOPIC)
     try:
         while rclpy.ok():
             rclpy.spin_once(node, timeout_sec=1.0)
@@ -467,8 +479,10 @@ def _spin_loop(state: dict, lock: threading.Lock) -> None:
     except KeyboardInterrupt:
         pass
     except Exception as exc:
-        log.error("ROS2 spin error: %s: %s", type(exc).__name__, exc)
+        _spin_error = f"{type(exc).__name__}: {exc}"
+        log.error("ROS2 spin error: %s", _spin_error)
     finally:
+        _spin_running = False
         node.destroy_node()
         rclpy.shutdown()
 

@@ -123,6 +123,8 @@ def get_status() -> dict:
         "spin_error": _spin_error,
         "spin_uptime_s": round(time.monotonic() - _spin_started_at, 1) if _spin_started_at else 0,
         "image_topic": ZED_IMAGE_TOPIC,
+        "ros_domain_id": os.environ.get("ROS_DOMAIN_ID", "0 (default)"),
+        "rmw_implementation": os.environ.get("RMW_IMPLEMENTATION", "(default)"),
     }
 
 

@@ -111,6 +111,23 @@ def create_admin_cmd(username, password):
 
 @sock.route("/telemetry")
 def telemetry_ws(ws):
+    # Validate the token supplied as a query parameter before streaming any data.
+    raw = request.args.get("token", "").strip()
+    raw = "".join(c for c in raw if c.isprintable() and ord(c) < 128)[:128]
+
+    now = _now_utc()
+    authorized = bool(raw) and any(
+        _token_expires(tok) > now and check_password_hash(tok.token, raw)
+        for tok in Token.query.all()
+    )
+
+    if not authorized:
+        try:
+            ws.close(status=1008, reason="Unauthorized")
+        except Exception:
+            pass
+        return
+
     try:
         while True:
             with _state_lock:

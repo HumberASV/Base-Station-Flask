@@ -1,0 +1,51 @@
+{
+  "phone": {
+    "active": true,
+    "publisher_node": "Phone_Pub",
+    "msg_type": "std_msgs/Float32MultiArray",
+    "layout": { "dim": [], "data_offset": 0 },
+    "data": [43.4643, -80.5204, 12.5, 270.0],
+    "fields": ["latitude", "longitude", "speed", "heading"]
+  },
+  "task": {
+    "active": true,
+    "publisher_node": "Task_Pub",
+    "msg_type": "std_msgs/Float32MultiArray",
+    "layout": { "dim": [], "data_offset": 0 },
+    "data": [1.0, 0.0, 1.0, null],
+    "fields": ["command", "target_heading", "target_speed", "dir"]
+  },
+  "motor": {
+    "active": true,
+    "publisher_node": "Motor_PubSub",
+    "msg_type": "std_msgs/Float32MultiArray",
+    "layout": { "dim": [], "data_offset": 0 },
+    "data": [0.75, 0.32, 0.55],
+    "fields": ["prop_l_fraction", "prop_r_fraction", "rudder_fraction"]
+  },
+  "global": {
+    "active": false,
+    "publisher_node": "Map_PubSub",
+    "msg_type": "std_msgs/Int8MultiArray",
+    "layout": { "dim": [], "data_offset": 0 },
+    "data": [[0, 0, 1, 0], [0, 1, 0, 0], "...50x50 grid, but assigned as nested list not flat - likely broken as written"],
+    "fields": ["global_map (2D obstacle grid)"]
+  },
+  "position": {
+    "active": false,
+    "publisher_node": "Map_PubSub",
+    "msg_type": "std_msgs/Float32MultiArray",
+    "layout": { "dim": [], "data_offset": 0 },
+    "data": [12, 12],
+    "fields": ["row", "col"],
+    "note": "Same publisher also sends [local_w, res] e.g. [20, 0.5] via publish_mapdata() - two different payload shapes share one topic"
+  },
+  "path": {
+    "active": false,
+    "publisher_node": "Path_PubSub",
+    "msg_type": "std_msgs/Int8MultiArray",
+    "layout": { "dim": [], "data_offset": 0 },
+    "data": ["(5,3)", "(6,4)", "(7,5)", "...list of (y,x) tuples, but assigned directly - Int8MultiArray.data expects flat ints, not tuples"],
+    "fields": ["waypoints (list of (y,x) cell coords)"]
+  }
+}

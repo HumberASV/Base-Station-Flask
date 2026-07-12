@@ -23,16 +23,22 @@ import math
 import threading
 import time
 
+## Module-level logger
+log = logging.getLogger(__name__)
+
+
+## Verify that the cv2, numpy, and bridge packages are available for image processing. If not, the ZED image subscription will be disabled.
 try:
     import cv2
     import numpy as np
     from cv_bridge import CvBridge
+    log.debug("cv2, numpy, and cv_bridge are available — ZED image subscription enabled.")
     _CV2_OK = True
 except ImportError:
+    log.warning("cv2, numpy, or cv_bridge not found — ZED image subscription disabled.")
     _CV2_OK = False
 
-log = logging.getLogger(__name__)
-
+## Verify that the zed_interfaces package is available for ZED object detection. If not, the ZED object detection subscription will be disabled.
 try:
     import rclpy
     from rclpy.node import Node
@@ -40,11 +46,15 @@ try:
     from std_msgs.msg import Float32MultiArray
     from nav_msgs.msg import Odometry
     from sensor_msgs.msg import Image
+    log.debug("rclpy and ROS2 message types are available — ROS2 bridge enabled.")
     _ROS2_AVAILABLE = True
 except ImportError:
+    # ROS2 not installed — disable the bridge and keep serving factory defaults.
     _ROS2_AVAILABLE = False
     log.warning("rclpy not found — ROS2 bridge disabled. Factory defaults will stream to clients.")
 
+    # Fallback Node class for non-ROS2 environments, so this script can be run
+    # without ROS2 installed (e.g., for testing the UDP streamer).
     class Node:  # type: ignore[no-redef]
         def __init__(self, *a, **kw): pass
         def get_logger(self): return log
@@ -53,10 +63,11 @@ except ImportError:
 
 try:
     from zed_msgs.msg import ObjectsStamped
+    log.debug("zed_msgs is available — ZED object detection subscription enabled.")
     _ZED_MSGS_AVAILABLE = True
 except ImportError:
     _ZED_MSGS_AVAILABLE = False
-    log.debug("zed_msgs not found — ZED object detection topic will not be subscribed.")
+    log.warning("zed_msgs not found — ZED object detection topic will not be subscribed.")
 
 # ---------------------------------------------------------------------------
 # Module-level JPEG frame buffer — written by the ROS2 bridge (raw frames)
@@ -68,23 +79,38 @@ _frame_lock = threading.Lock()
 
 
 def set_latest_frame(jpeg: bytes) -> None:
+    """
+    Update the latest JPEG frame buffer with a new frame.
+    Arguments:
+        jpeg: The JPEG-encoded image data to store as the latest frame.
+    """
     global _latest_frame
     with _frame_lock:
         _latest_frame = jpeg
 
 
 def get_latest_frame() -> bytes | None:
+    """
+    Retrieve the latest JPEG frame buffer.
+    Returns:
+        The latest JPEG-encoded image data, or None if no frame is available.
+    """
     with _frame_lock:
         return _latest_frame
 
-
+# Topic names for the ASV ROS2 topics consumed by the bridge.
 PHONE_TOPIC = "Phone"
 TASK_TOPIC = "Task"
 ZED_ODOM_TOPIC = "zed/odom"
 ZED_IMAGE_TOPIC = "zed/rgb/color/rect/image"
 ZED_OBJECTS_TOPIC = "zed/obj_det/objects"
 
+# Threshold in seconds for staleness detection of ASV topics. If a topic hasn't
+# delivered a message within this time, the bridge logs a warning and zeroes the
+# signal-strength field, so the web client knows the ASV is unreachable.
 _STALE_THRESHOLD_S = 5.0
+
+# Maximum number of log entries to keep in the rolling log for each topic.
 _LOG_MAX = 50
 
 # Maps the action float published by Task to a TaskStatus string
@@ -96,7 +122,13 @@ _ACTION_TO_STATUS = {
 
 
 def _quat_to_rpy(x: float, y: float, z: float, w: float) -> tuple[float, float, float]:
-    """Convert quaternion to (roll, pitch, yaw) in radians."""
+    """
+    Convert quaternion to (roll, pitch, yaw) in radians.
+    Args:
+        x, y, z, w: Quaternion components.
+    Returns:
+        A tuple containing the roll, pitch, and yaw angles in radians.
+    """
     sinr_cosp = 2.0 * (w * x + y * z)
     cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
     roll = math.atan2(sinr_cosp, cosr_cosp)
@@ -112,14 +144,24 @@ def _quat_to_rpy(x: float, y: float, z: float, w: float) -> tuple[float, float, 
 
 
 def _append_log(log_list: list, entry: str) -> None:
-    """Append to the rolling log, avoiding duplicate consecutive entries."""
+    """
+    Append to the rolling log, avoiding duplicate consecutive entries.
+    Args:
+        log_list: The list of log entries to append to.
+        entry: The new log entry to add.
+    """
     if not log_list or log_list[-1] != entry:
         log_list.append(entry)
     if len(log_list) > _LOG_MAX:
         del log_list[:-_LOG_MAX]
 
 def _draw_ros_objects(frame: "np.ndarray", objects: list) -> None:
-    """Draw 2D bounding boxes from raw ZED ROS2 objects onto frame in-place."""
+    """
+    Draw 2D bounding boxes from raw ZED ROS2 objects onto frame in-place.
+    Args:
+        frame: The image frame to draw on.
+        objects: A list of ZED ROS2 object messages.
+    """
     if not (_CV2_OK and objects):
         return
     for obj in objects:
@@ -147,6 +189,12 @@ class _BaseStationNode(Node):
     """
 
     def __init__(self, state: dict, lock: threading.Lock):
+        """
+        Initialize the base station ROS2 node.
+        Arguments:
+            state: Shared telemetry state dictionary to update.
+            lock: Threading lock for synchronizing access to the state.
+        """
         super().__init__("base_station_receiver")
         self._state = state
         self._lock = lock
@@ -187,6 +235,9 @@ class _BaseStationNode(Node):
     # Phone: [latitude, longitude, speed, heading]
     # ------------------------------------------------------------------
     def _on_phone(self, msg):
+        """
+        Callback for handling incoming phone location messages.
+        """
         d = msg.data
         if len(d) < 4:
             return
@@ -206,6 +257,9 @@ class _BaseStationNode(Node):
     # Task: [action, target_heading, target_speed]
     # ------------------------------------------------------------------
     def _on_task(self, msg):
+        """
+        Callback for handling incoming task messages.
+        """
         d = msg.data
         if len(d) < 3:
             return
@@ -229,6 +283,9 @@ class _BaseStationNode(Node):
     # ZED: odom  (nav_msgs/Odometry)
     # ------------------------------------------------------------------
     def _on_zed_odom(self, msg):
+        """
+        Callback for handling incoming ZED odometry messages.
+        """
         p = msg.pose.pose.position
         o = msg.pose.pose.orientation
         roll, pitch, yaw = _quat_to_rpy(o.x, o.y, o.z, o.w)
@@ -246,6 +303,9 @@ class _BaseStationNode(Node):
     # ZED: RGB image  (sensor_msgs/Image) — stores metadata + produces JPEG
     # ------------------------------------------------------------------
     def _on_zed_image(self, msg):
+        """
+        Callback for handling incoming ZED RGB image messages.
+        """
         with self._lock:
             cam = self._state["zed"]["camera"]
             cam["active"] = True
@@ -271,6 +331,9 @@ class _BaseStationNode(Node):
     # ZED: object detection  (zed_msgs/ObjectsStamped)
     # ------------------------------------------------------------------
     def _on_zed_objects(self, msg):
+        """
+        Callback for handling incoming ZED object detection messages.
+        """
         objects = [
             {
                 "label": obj.label,
@@ -294,6 +357,9 @@ class _BaseStationNode(Node):
     # Staleness check — called once per spin iteration
     # ------------------------------------------------------------------
     def tick(self):
+        """
+        Check the staleness of various data sources.
+        """
         now = time.monotonic()
         with self._lock:
             log_list = self._state["task"]["log"]
@@ -322,6 +388,12 @@ class _BaseStationNode(Node):
 # ----------------------------------------------------------------------
 
 def _spin_loop(state: dict, lock: threading.Lock) -> None:
+    """
+    Spin the ROS2 node in a loop, handling incoming messages and updating the shared state.
+    Arguments:
+        state: Shared telemetry state dictionary to update.
+        lock: Threading lock for synchronizing access to the state.
+    """
     try:
         rclpy.init()
     except Exception as exc:
@@ -339,10 +411,13 @@ def _spin_loop(state: dict, lock: threading.Lock) -> None:
         node.destroy_node()
         rclpy.shutdown()
 
-def start(state: dict, lock: threading.Lock) -> "threading.Thread | None":
+def start(state: dict, lock: threading.Lock) -> threading.Thread | None:
     """
     Start the ROS2 bridge in a daemon thread.
     Returns None (and does nothing) when ROS2 is not installed.
+    Arguments:
+        state: Shared telemetry state dictionary to update.
+        lock: Threading lock for synchronizing access to the state.
     """
     if not _ROS2_AVAILABLE:
         return None

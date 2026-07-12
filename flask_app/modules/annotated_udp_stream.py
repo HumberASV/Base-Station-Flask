@@ -34,11 +34,17 @@ import argparse
 import socket
 import struct
 import threading
+import logging
+
+log = logging.getLogger(__name__)
 
 try:
     import ros2_bridge as _ros2_bridge
+    log.debug("ros2_bridge module imported successfully.")
+    
 except ImportError:
     _ros2_bridge = None  # type: ignore[assignment]
+    log.warning("ros2_bridge module not found — annotated frames will not be shared with Flask.")
 
 import cv2
 import numpy as np
@@ -49,10 +55,14 @@ try:
     from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSDurabilityPolicy
     from sensor_msgs.msg import Image
     from cv_bridge import CvBridge
+    log.debug("rclpy and ROS2 message types are available — ROS2 bridge enabled.")
     _ROS2_OK = True
 except ImportError:
     _ROS2_OK = False
+    log.warning("rclpy not found — ROS2 bridge disabled. Annotated frames will not be produced.")
 
+    # Fallback Node class for non-ROS2 environments, so this script can be run
+    # without ROS2 installed (e.g., for testing the UDP streamer).
     class Node:  # type: ignore[no-redef]
         def __init__(self, *a, **kw): pass
         def get_logger(self): return _FallbackLog()
@@ -66,10 +76,13 @@ except ImportError:
 
 try:
     from zed_interfaces.msg import ObjectsStamped
+    log.debug("zed_interfaces is available — ZED object detection subscription enabled.")
     _ZED_OK = True
 except ImportError:
+    log.warning("zed_interfaces not found — ZED object detection topic will not be subscribed.")
     _ZED_OK = False
 
+# Constants for UDP frame protocol
 _MAGIC = b'ZFRM'
 _HDR_FMT = '>4sIHH'                    # magic(4) frame_id(4) chunk_idx(2) num_chunks(2)
 _HDR_SIZE = struct.calcsize(_HDR_FMT)  # 12 bytes
@@ -93,7 +106,7 @@ class _UDPStreamer:
         threading.Thread(target=self._accept_loop, daemon=True, name='udp-accept').start()
         print(f'[UDP] Listening for clients on :{port}')
 
-    def _accept_loop(self):
+    def _accept_loop(self) -> None:
         while self._running:
             try:
                 _, addr = self._sock.recvfrom(64)
@@ -106,7 +119,7 @@ class _UDPStreamer:
             except OSError:
                 break
 
-    def send_frame(self, jpeg: bytes):
+    def send_frame(self, jpeg: bytes) -> None:
         with self._lock:
             if not self._clients:
                 return
@@ -131,7 +144,7 @@ class _UDPStreamer:
             for addr in dead:
                 print(f'[UDP] Client dropped {addr[0]}:{addr[1]}')
 
-    def stop(self):
+    def stop(self) -> None:
         self._running = False
         self._sock.close()
 
@@ -156,8 +169,17 @@ def _draw_objects(frame: np.ndarray, objects: list) -> None:
 
 
 class _AnnotatedStreamNode(Node):
+    """ROS2 node that subscribes to ZED image and object topics, draws bounding boxes, and streams annotated frames via UDP."""
 
     def __init__(self, streamer: _UDPStreamer, image_topic: str, objects_topic: str, quality: int):
+        """
+        Initialize the annotated UDP stream node.
+        Arguments:
+            streamer: _UDPStreamer instance for broadcasting frames.
+            image_topic: ROS2 topic name for ZED camera images.
+            objects_topic: ROS2 topic name for ZED object detection results.
+            quality: JPEG quality (1-100) for annotated frames.
+        """
         if _ROS2_OK:
             super().__init__('annotated_udp_stream')
 
@@ -170,6 +192,7 @@ class _AnnotatedStreamNode(Node):
         if not _ROS2_OK:
             return
 
+        # Set up ROS2 subscriptions with appropriate QoS profiles
         reliable_qos = QoSProfile(depth=10)
         video_qos = QoSProfile(
             depth=1,
@@ -187,11 +210,17 @@ class _AnnotatedStreamNode(Node):
                 f'zed_interfaces unavailable — subscribed to {image_topic} only (no overlay)'
             )
 
-    def _on_objects(self, msg: 'ObjectsStamped'):
+    def _on_objects(self, msg: 'ObjectsStamped') -> None:
+        """
+        Callback for handling incoming object detection messages.
+        """
         with self._obj_lock:
             self._objects = list(msg.objects)
 
-    def _on_image(self, msg: 'Image'):
+    def _on_image(self, msg: 'Image') -> None:
+        """
+        Callback for handling incoming image messages, drawing bounding boxes, and streaming annotated frames.
+        """
         try:
             frame = self._bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         except Exception as exc:
@@ -212,7 +241,10 @@ class _AnnotatedStreamNode(Node):
                 _ros2_bridge.set_latest_frame(jpeg)
 
 
-def main():
+def main() -> None:
+    """
+    Main function to initialize and run the annotated UDP stream node.
+    """
     ap = argparse.ArgumentParser(description='ZED annotated UDP stream')
     ap.add_argument('--port', type=int, default=9999)
     ap.add_argument('--image-topic', default='zed/rgb/color/rect/image')

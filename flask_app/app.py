@@ -6,8 +6,6 @@ import threading
 import time
 
 from flask import Flask, render_template, request, jsonify, Response
-from flask_login import LoginManager, UserMixin, login_required, login_user, logout_user
-from flask_sqlalchemy import SQLAlchemy
 from flask_sock import Sock
 
 from factory import telemetry_factory
@@ -17,15 +15,8 @@ logging.basicConfig(level=logging.INFO)
 
 app = Flask(__name__)
 app.secret_key = os.getenv("SECRET_KEY", "change-me-in-production")
-app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv("DATABASE_URL", "sqlite:///app.db")
-app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
-db = SQLAlchemy(app)
 sock = Sock(app)
-
-login_manager = LoginManager(app)
-login_manager.login_view = "admin_login"
-
 # ---------------------------------------------------------------------------
 # Shared telemetry state — written by the ROS2 bridge, read by WebSocket clients
 # ---------------------------------------------------------------------------
@@ -37,34 +28,6 @@ ros2_bridge.start(_telemetry_state, _state_lock)
 
 # Inject the video stream path so the WebSocket payload always includes it.
 _telemetry_state["video"] = {"streamUrl": "/video_feed"}
-
-
-# ---------------------------------------------------------------------------
-# Database models
-# ---------------------------------------------------------------------------
-
-class User(UserMixin, db.Model):
-    __tablename__ = "users"
-    id = db.Column(db.Integer, primary_key=True)
-    username = db.Column(db.String(80), unique=True, nullable=False)
-    password_hash = db.Column(db.String(128), nullable=False)
-
-
-class Token(db.Model):
-    __tablename__ = "tokens"
-    id = db.Column(db.Integer, primary_key=True)
-    token = db.Column(db.String(128), unique=True, nullable=False)
-    user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
-    expires_at = db.Column(db.DateTime, nullable=False)
-
-
-with app.app_context():
-    db.create_all()
-
-
-@login_manager.user_loader
-def load_user(user_id):
-    return db.session.get(User, int(user_id))
 
 
 # ---------------------------------------------------------------------------
@@ -109,47 +72,6 @@ def video_feed():
     r = Response(generate(), mimetype="multipart/x-mixed-replace; boundary=frame")
     r.headers["Access-Control-Allow-Origin"] = "*"
     return r
-
-
-# ---------------------------------------------------------------------------
-# Admin routes
-# ---------------------------------------------------------------------------
-
-@app.route("/admin")
-@login_required
-def admin():
-    """Admin dashboard for managing access tokens."""
-    return render_template("admin.html")
-
-
-@app.route("/admin/login", methods=["GET", "POST"])
-def admin_login():
-    return render_template("login.html")
-
-
-@app.route("/admin/create_token", methods=["POST"])
-@login_required
-def create_token():
-    pass
-
-
-@app.route("/admin/revoke_token", methods=["POST"])
-@login_required
-def revoke_token():
-    pass
-
-
-@app.route("/admin/expire_token", methods=["POST"])
-@login_required
-def expire_token():
-    pass
-
-
-@app.route("/admin/tokens")
-@login_required
-def tokens():
-    pass
-
 
 # ---------------------------------------------------------------------------
 # Client / error routes

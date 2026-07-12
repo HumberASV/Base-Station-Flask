@@ -4,6 +4,10 @@ flask>=3.0
 # Plain WebSocket support (consumed by `new WebSocket()` on the web client)
 flask-sock>=0.7
 
+# Used to decode/encode the fallback video clip served by /video_feed
+# when ROS2 (and its own cv2 install) isn't available.
+opencv-python-headless>=4.8
+
 # Note: rclpy is NOT pip-installable.
 # It is provided by the ROS2 Humble installation via:
 #   source /opt/ros/humble/setup.bash

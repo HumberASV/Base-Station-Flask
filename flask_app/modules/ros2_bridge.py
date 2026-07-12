@@ -180,6 +180,33 @@ def _draw_ros_objects(frame: "np.ndarray", objects: list) -> None:
         cv2.putText(frame, label, (x0 + 2, y0 - 3),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
 
+def is_ros2_available() -> bool:
+    """
+    Check if ROS2 is available in the current environment.
+    Returns:
+        True if ROS2 is available, False otherwise.
+    """
+    return _ROS2_AVAILABLE
+
+def is_zed_available() -> bool:
+    """
+    Check if ZED message types are available in the current environment.
+    Returns:
+        True if ZED message types are available, False otherwise.
+    """
+    return _ZED_MSGS_AVAILABLE
+
+def get_available_topics() -> list[str]:
+    """
+    Get a list of available ROS2 topics that the bridge can subscribe to.
+    Returns:
+        A list of topic names that are available for subscription.
+    """
+    topics = [PHONE_TOPIC, TASK_TOPIC, ZED_ODOM_TOPIC, ZED_IMAGE_TOPIC]
+    if _ZED_MSGS_AVAILABLE:
+        topics.append(ZED_OBJECTS_TOPIC)
+    return topics
+
 
 class _BaseStationNode(Node):
     """

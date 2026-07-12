@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='favicon.svg') }}">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200" />
+    <link href="https://fonts.googleapis.com/css2?family=Montserrat:ital,wght@0,100..900;1,100..900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <title>{{ title if title else "HumberASV Base-Station" }}</title>
+</head>
+<body>
+
+    <input type="checkbox" id="drawer-toggle" class="drawer-toggle-input">
+
+    <header>
+        <nav>
+            <a href="{{ url_for('index') }}">
+                <img
+                    src="{{ url_for('static', filename='logo/logo.png') }}"
+                    srcset="
+                            {{ url_for('static', filename='logo/logo.png') }} 480w,
+                            {{ url_for('static', filename='logo/horizontal-logo.png') }} 800w"
+                    sizes="(max-width: 600px) 480px, 800px"
+                    alt="HumberASV Logo"
+                    class="logo"
+                >
+            </a>
+            <label for="drawer-toggle" class="drawer-open-btn" aria-label="Open navigation menu">
+                <span class="material-symbols-outlined">
+                    menu
+                </span>
+            </label>
+        </nav>
+    </header>
+
+    <hr>
+
+    <div class="drawer">
+        <label for="drawer-toggle" class="drawer-backdrop" aria-hidden="true"></label>
+        <nav class="navigation">
+            <label for="drawer-toggle" class="menu-toggle" aria-label="Close navigation menu"></label>
+            <ul class="menu">
+                <li>
+                    <a href="{{ url_for('index') }}">
+                        <span class="icon material-symbols-outlined">home</span>
+                        <span class="text">Home</span>
+                    </a>
+                </li>
+                {%- if dashboard_enabled %}
+                <li>
+                    <a href="{{ url_for('dashboard') }}">
+                        <span class="icon material-symbols-outlined">dashboard</span>
+                        <span class="text">Dashboard</span>
+                    </a>
+                </li>
+                {%- endif %}
+                <li>
+                    <a href="{{ url_for('video_feed') }}">
+                        <span class="icon material-symbols-outlined">videocam</span>
+                        <span class="text">Video Stream</span>
+                    </a>
+                </li>
+            </ul>
+        </nav>
+    </div>
+
+    <!-- Child templates inject their unique content inside this block -->
+    <main>
+        {% block content %}
+        {% endblock %}
+    </main>
+
+    <hr>
+    <footer>
+        <p>&copy; 2026 HumberASV</p>
+    </footer>
+
+</body>
+</html>

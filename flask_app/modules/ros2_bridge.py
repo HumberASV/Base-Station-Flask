@@ -20,6 +20,7 @@ start and the app keeps serving factory defaults.
 
 import logging
 import math
+import os
 import threading
 import time
 
@@ -43,6 +44,7 @@ try:
     import rclpy
     from rclpy.node import Node
     from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSDurabilityPolicy
+    from rcl_interfaces.msg import Log as RosoutLog
     from std_msgs.msg import Float32MultiArray
     from nav_msgs.msg import Odometry
     from sensor_msgs.msg import Image
@@ -74,8 +76,23 @@ except ImportError:
 # and overwritten by annotated_udp_stream when it is also running.
 # Flask's /video_feed route reads from here.
 # ---------------------------------------------------------------------------
-_latest_frame: bytes | None = None
+_SAD_FRAME: bytes | None = None
+_sad_path = os.path.join(os.path.dirname(__file__), "images", "sad.jpg")
+try:
+    with open(_sad_path, "rb") as _f:
+        _SAD_FRAME = _f.read()
+except OSError:
+    log.warning("Could not load fallback image: %s", _sad_path)
+
+_latest_frame: bytes | None = _SAD_FRAME
 _frame_lock = threading.Lock()
+_frames_received: int = 0  # incremented each time _on_zed_image fires
+_spin_running: bool = False
+_spin_error: str = ""
+_spin_started_at: float = 0.0
+
+log.info("ros2_bridge ready  cv2=%s  cv_bridge=%s  pil=%s  ros2=%s  sad_frame=%s",
+         _CV2_OK, _CVBRIDGE_OK, _PIL_OK, _ROS2_AVAILABLE, _SAD_FRAME is not None)
 
 
 def set_latest_frame(jpeg: bytes) -> None:
@@ -101,9 +118,10 @@ def get_latest_frame() -> bytes | None:
 # Topic names for the ASV ROS2 topics consumed by the bridge.
 PHONE_TOPIC = "Phone"
 TASK_TOPIC = "Task"
-ZED_ODOM_TOPIC = "zed/odom"
-ZED_IMAGE_TOPIC = "zed/rgb/color/rect/image"
+ZED_ODOM_TOPIC = "zed/zed_node/odom"
+ZED_IMAGE_TOPIC = "/zed/zed_node/rgb/color/rect/image"
 ZED_OBJECTS_TOPIC = "zed/obj_det/objects"
+ROSOUT_TOPIC = "/rosout"
 
 # Threshold in seconds for staleness detection of ASV topics. If a topic hasn't
 # delivered a message within this time, the bridge logs a warning and zeroes the
@@ -154,6 +172,16 @@ def _append_log(log_list: list, entry: str) -> None:
         log_list.append(entry)
     if len(log_list) > _LOG_MAX:
         del log_list[:-_LOG_MAX]
+
+def _to_bgr_cv2(frame: "np.ndarray", enc: str) -> "np.ndarray":
+    if enc in ('bgra8', 'bgra'):
+        return cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+    if enc in ('rgba8', 'rgba'):
+        return cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
+    if enc in ('rgb8', 'rgb'):
+        return cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+    return frame  # already bgr8
+
 
 def _draw_ros_objects(frame: "np.ndarray", objects: list) -> None:
     """
@@ -230,22 +258,30 @@ class _BaseStationNode(Node):
         self._last_zed_odom = 0.0
         self._last_zed_image = 0.0
         self._last_zed_objects = 0.0
-        self._bridge = CvBridge() if _CV2_OK else None
+        self._bridge = CvBridge() if (_CV2_OK and _CVBRIDGE_OK) else None
+        log.info("[ZED] cv2=%s cv_bridge=%s", _CV2_OK, _CVBRIDGE_OK)
         # Raw ROS2 ZED objects kept for annotation overlay (not serialized into state)
         self._raw_objects: list = []
         self._raw_objects_lock = threading.Lock()
 
         reliable_qos = QoSProfile(depth=10)
-        video_qos = QoSProfile(
+        best_effort_qos = QoSProfile(
             depth=10,
             reliability=QoSReliabilityPolicy.BEST_EFFORT,
             durability=QoSDurabilityPolicy.VOLATILE,
         )
+        # ZED image publisher uses RELIABLE — match it so DDS negotiation always succeeds
+        video_qos = QoSProfile(
+            depth=1,
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.VOLATILE,
+        )
 
-        self.create_subscription(Float32MultiArray, PHONE_TOPIC, self._on_phone, 10)
-        self.create_subscription(Float32MultiArray, TASK_TOPIC, self._on_task, 10)
-        self.create_subscription(Odometry, ZED_ODOM_TOPIC, self._on_zed_odom, reliable_qos)
+        self.create_subscription(Float32MultiArray, PHONE_TOPIC, self._on_phone, best_effort_qos)
+        self.create_subscription(Float32MultiArray, TASK_TOPIC, self._on_task, best_effort_qos)
+        self.create_subscription(Odometry, ZED_ODOM_TOPIC, self._on_zed_odom, best_effort_qos)
         self.create_subscription(Image, ZED_IMAGE_TOPIC, self._on_zed_image, video_qos)
+        self.create_subscription(RosoutLog, ROSOUT_TOPIC, self._on_rosout, reliable_qos)
         if _ZED_MSGS_AVAILABLE:
             self.create_subscription(
                 ObjectsStamped, ZED_OBJECTS_TOPIC, self._on_zed_objects, reliable_qos
@@ -269,6 +305,7 @@ class _BaseStationNode(Node):
         if len(d) < 4:
             return
         lat, lon, speed, heading = float(d[0]), float(d[1]), float(d[2]), float(d[3])
+        log.debug("[Phone] lat=%.6f lon=%.6f speed=%.3f heading=%.2f", lat, lon, speed, heading)
         with self._lock:
             s = self._state
             s["asv"]["latitude"] = lat
@@ -294,6 +331,7 @@ class _BaseStationNode(Node):
         target_heading = float(d[1])
         target_speed = float(d[2])
         status = _ACTION_TO_STATUS.get(action, "standby")
+        log.debug("[Task] action=%.0f status=%s heading=%.1f speed=%.3f", action, status, target_heading, target_speed)
         entry = (
             f"Task — action={action:.0f} "
             f"heading={target_heading:.1f}° "
@@ -316,6 +354,8 @@ class _BaseStationNode(Node):
         p = msg.pose.pose.position
         o = msg.pose.pose.orientation
         roll, pitch, yaw = _quat_to_rpy(o.x, o.y, o.z, o.w)
+        log.debug("[ZED/odom] pos=(%.3f, %.3f, %.3f) rpy=(%.1f°, %.1f°, %.1f°)",
+                  p.x, p.y, p.z, math.degrees(roll), math.degrees(pitch), math.degrees(yaw))
         with self._lock:
             zed = self._state["zed"]["odom"]
             zed["position"] = {"x": float(p.x), "y": float(p.y), "z": float(p.z)}
@@ -341,18 +381,68 @@ class _BaseStationNode(Node):
             cam["encoding"] = msg.encoding
         self._last_zed_image = time.monotonic()
 
-        if not (_CV2_OK and self._bridge):
-            return
-        try:
-            frame = self._bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-            with self._raw_objects_lock:
-                raw_objs = list(self._raw_objects)
-            _draw_ros_objects(frame, raw_objs)
-            ok, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-            if ok:
-                set_latest_frame(buf.tobytes())
-        except Exception as exc:
-            log.debug("Frame encode error: %s", exc)
+        jpeg = self._encode_jpeg(msg)
+        if jpeg is not None:
+            set_latest_frame(jpeg)
+            log.debug("[ZED/image] buffered %d bytes", len(jpeg))
+        else:
+            log.warning("[ZED/image] all encode paths failed — frame dropped")
+
+    def _encode_jpeg(self, msg) -> "bytes | None":
+        enc = msg.encoding.lower()
+
+        # ── Path 1: cv_bridge + cv2 ──────────────────────────────────────
+        if _CV2_OK and self._bridge:
+            try:
+                frame = self._bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
+                frame = _to_bgr_cv2(frame, enc)
+                with self._raw_objects_lock:
+                    _draw_ros_objects(frame, list(self._raw_objects))
+                ok, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                if ok:
+                    return buf.tobytes()
+                log.warning("[ZED/image] cv_bridge path: imencode failed")
+            except Exception as exc:
+                log.warning("[ZED/image] cv_bridge path failed: %s", exc, exc_info=True)
+
+        # ── Path 2: numpy + cv2 (no cv_bridge) ───────────────────────────
+        if _CV2_OK:
+            try:
+                raw = np.frombuffer(bytes(msg.data), dtype=np.uint8)
+                n_ch = msg.step // msg.width
+                frame = raw.reshape((msg.height, msg.width, n_ch))
+                frame = _to_bgr_cv2(frame, enc)
+                ok, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                if ok:
+                    return buf.tobytes()
+                log.warning("[ZED/image] numpy path: imencode failed")
+            except Exception as exc:
+                log.warning("[ZED/image] numpy path failed: %s", exc, exc_info=True)
+
+        # ── Path 3: PIL (no cv2 at all) ───────────────────────────────────
+        if _PIL_OK:
+            try:
+                raw = bytes(msg.data)
+                if enc in ('bgra8', 'bgra'):
+                    img = _PILImage.frombuffer('RGBA', (msg.width, msg.height), raw, 'raw', 'BGRA', 0, 1).convert('RGB')
+                elif enc in ('rgba8', 'rgba'):
+                    img = _PILImage.frombuffer('RGBA', (msg.width, msg.height), raw, 'raw', 'RGBA', 0, 1).convert('RGB')
+                elif enc in ('bgr8', 'bgr'):
+                    img = _PILImage.frombuffer('RGB', (msg.width, msg.height), raw, 'raw', 'BGR', 0, 1)
+                elif enc in ('rgb8', 'rgb'):
+                    img = _PILImage.frombuffer('RGB', (msg.width, msg.height), raw, 'raw', 'RGB', 0, 1)
+                else:
+                    log.warning("[ZED/image] PIL: unsupported encoding %s", msg.encoding)
+                    return None
+                buf = _io.BytesIO()
+                img.save(buf, format='JPEG', quality=80)
+                return buf.getvalue()
+            except Exception as exc:
+                log.warning("[ZED/image] PIL path failed: %s", exc, exc_info=True)
+
+        log.warning("[ZED/image] no encoder available  cv2=%s  cv_bridge=%s  pil=%s",
+                    _CV2_OK, _CVBRIDGE_OK, _PIL_OK)
+        return None
 
     # ------------------------------------------------------------------
     # ZED: object detection  (zed_msgs/ObjectsStamped)
@@ -379,6 +469,20 @@ class _BaseStationNode(Node):
         with self._raw_objects_lock:
             self._raw_objects = list(msg.objects)
         self._last_zed_objects = time.monotonic()
+
+    # ------------------------------------------------------------------
+    # /rosout  (rcl_interfaces/Log) — system-wide ROS2 log stream
+    # ------------------------------------------------------------------
+    _ROSOUT_LEVEL = {10: "DEBUG", 20: "INFO", 30: "WARN", 40: "ERROR", 50: "FATAL"}
+
+    def _on_rosout(self, msg):
+        level = self._ROSOUT_LEVEL.get(msg.level, str(msg.level))
+        if msg.level < 20:  # skip DEBUG — too noisy
+            return
+        entry = f"[{level}] [{msg.name}]: {msg.msg}"
+        log.debug("[rosout] %s", entry)
+        with self._lock:
+            _append_log(self._state["task"]["log"], entry)
 
     # ------------------------------------------------------------------
     # Staleness check — called once per spin iteration
@@ -408,6 +512,8 @@ class _BaseStationNode(Node):
                 self._state["zed"]["camera"]["active"] = False
                 _append_log(log_list, "WARNING: ZED camera feed lost.")
                 self._last_zed_image = now
+                if _SAD_FRAME is not None:
+                    set_latest_frame(_SAD_FRAME)
 
 
 # ----------------------------------------------------------------------
@@ -424,17 +530,25 @@ def _spin_loop(state: dict, lock: threading.Lock) -> None:
     try:
         rclpy.init()
     except Exception as exc:
-        log.error("rclpy.init() failed (%s) — ROS2 bridge disabled.", exc)
+        _spin_error = f"rclpy.init() failed: {exc}"
+        log.error(_spin_error)
         return
 
+    _spin_started_at = time.monotonic()
     node = _BaseStationNode(state, lock)
+    _spin_running = True
+    log.info("ROS2 spin loop running (topic=%s)", ZED_IMAGE_TOPIC)
     try:
         while rclpy.ok():
             rclpy.spin_once(node, timeout_sec=1.0)
             node.tick()
+    except KeyboardInterrupt:
+        pass
     except Exception as exc:
-        log.error("ROS2 spin error: %s", exc)
+        _spin_error = f"{type(exc).__name__}: {exc}"
+        log.error("ROS2 spin error: %s", _spin_error)
     finally:
+        _spin_running = False
         node.destroy_node()
         rclpy.shutdown()
 

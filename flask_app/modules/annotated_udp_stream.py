@@ -222,7 +222,14 @@ class _AnnotatedStreamNode(Node):
         Callback for handling incoming image messages, drawing bounding boxes, and streaming annotated frames.
         """
         try:
-            frame = self._bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            frame = self._bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
+            enc = msg.encoding.lower()
+            if enc in ('bgra8', 'bgra'):
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+            elif enc in ('rgba8', 'rgba'):
+                frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
+            elif enc in ('rgb8', 'rgb'):
+                frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
         except Exception as exc:
             self.get_logger().warn(f'cv_bridge error: {exc}')
             return
@@ -247,7 +254,7 @@ def main() -> None:
     """
     ap = argparse.ArgumentParser(description='ZED annotated UDP stream')
     ap.add_argument('--port', type=int, default=9999)
-    ap.add_argument('--image-topic', default='zed/rgb/color/rect/image')
+    ap.add_argument('--image-topic', default='/zed/zed_node/rgb/color/rect/image')
     ap.add_argument('--objects-topic', default='zed/obj_det/objects')
     ap.add_argument('--quality', type=int, default=80, metavar='1-100')
     args = ap.parse_args()

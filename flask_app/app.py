@@ -1,4 +1,3 @@
-import copy
 import json
 import logging
 import os
@@ -54,7 +53,8 @@ from flask_sock import Sock
 from factory import telemetry_factory
 from modules import ros2_bridge
 
-logging.basicConfig(level=logging.INFO)
+_debug = os.getenv("FLASK_DEBUG", "0") == "1"
+logging.basicConfig(level=logging.DEBUG if _debug else logging.INFO)
 
 app = Flask(__name__)
 app.secret_key = os.getenv("SECRET_KEY", "change-me-in-production")
@@ -69,7 +69,6 @@ FALLBACK_VIDEO_PATH = os.path.join(os.path.dirname(__file__), "assets", "video",
 _state_lock = threading.Lock()
 _telemetry_state: dict = telemetry_factory.make_default_state()
 
-# Start the ROS2 bridge (no-op when ROS2 is not installed)
 ros2_bridge.start(_telemetry_state, _state_lock)
 
 # Inject the video stream path so the WebSocket payload always includes it.
@@ -107,17 +106,11 @@ if DASHBOARD_MODE:
         )
 
 # ---------------------------------------------------------------------------
-# WebSocket — telemetry stream (plain WebSocket, consumed by the web client)
+# WebSocket — telemetry stream
 # ---------------------------------------------------------------------------
 
 @sock.route("/telemetry")
 def telemetry_ws(ws):
-    """
-    Streams the current telemetry state to connected web clients at 10 Hz.
-    Each frame is a JSON-serialised Status object matching the web client type.
-    The connection is plain WebSocket (not socket.io) so `new WebSocket(url)`
-    on the client side works directly.
-    """
     try:
         while True:
             with _state_lock:
@@ -125,12 +118,11 @@ def telemetry_ws(ws):
             ws.send(payload)
             time.sleep(0.1)
     except Exception:
-        pass  # client disconnected
+        pass
 
 
 # ---------------------------------------------------------------------------
-# MJPEG video feed — served from the frame buffer populated by ros2_bridge
-# (raw frames) or annotated_udp_stream (annotated frames, takes priority).
+# Video routes
 # ---------------------------------------------------------------------------
 
 def _fallback_video_frames():
@@ -180,8 +172,8 @@ def video_feed():
 
 @app.route("/uh_oh")
 def uh_oh():
-    """Displayed when a user presents an invalid or expired token."""
-    return render_template("uh_oh.html")
+    message = "No data is being received from the ASV."
+    return render_template("uh_oh.html", message=message)
 
 
 if __name__ == "__main__":

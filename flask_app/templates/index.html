@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+
+{% block title %}HumberASV Base-Station{% endblock %}
+
+{% block content %}
+<div class="container">
+    <h1>Welcome to HumberASV Base-Station</h1>
+    <p>This is the main API for viewing Loon-E telemetry data.</p>
+</div>
+
+<div class="container">
+    <h2>Available Endpoints</h2>
+    <ul>
+        <li><a href="/api/telemetry">/api/telemetry</a> - Get the latest telemetry data.</li>
+        <li><a href="/api/status">/api/status</a> - Get the current status of the system.</li>
+        <li><a href="/api/logs">/api/logs</a> - Get the system logs.</li>
+    </ul>
+</div>
+
+<div class="container">
+    <h1>Other Resources</h1>
+    <article>
+        <h1>Humber ASV Website</h1>
+        <a 
+            href="https://humberasv.ca" 
+            target="_blank"
+            rel="noopener noreferrer"
+        >
+            <p>Visit the Humber ASV Website</p>
+        </a>
+    </article>
+    <article>
+        <h1>Humber ASV GitHub</h1>
+        <a 
+            href="https://github.com/HumberASV" 
+            target="_blank"
+            rel="noopener noreferrer"
+        >
+            <p>Visit the Humber ASV GitHub</p>
+        </a>
+    </article>
+</div>
+{% endblock %}

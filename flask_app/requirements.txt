@@ -1,14 +1,12 @@
 # Flask core
 flask>=3.0
-flask-login>=0.6
-flask-sqlalchemy>=3.1
 
 # Plain WebSocket support (consumed by `new WebSocket()` on the web client)
 flask-sock>=0.7
 
-# Database driver — MariaDB via PyMySQL
-PyMySQL>=1.1
-cryptography>=42.0   # required by PyMySQL for auth plugin support
+# Used to decode/encode the fallback video clip served by /video_feed
+# when ROS2 (and its own cv2 install) isn't available.
+opencv-python-headless>=4.8
 
 # Note: rclpy is NOT pip-installable.
 # It is provided by the ROS2 Humble installation via:

@@ -28,38 +28,6 @@ def make_default_state() -> dict:
     Fields are updated in-place by ros2_bridge as real data arrives.
     """
     return {
-        "map": {
-            "occupancyGrid": [],
-            "navigationGrid": [],
-        },
-        "planning": {
-            "status": "standby",
-            "course": [],
-            "plan": [],
-        },
-        "task": {
-            "log": [random.choice(logs)],
-            "location": {"latitude": 0.0, "longitude": 0.0},
-            "data": {
-                "id": 0,
-                "name": "No active task",
-                "status": "standby",
-                "latitude": 0.0,
-                "longitude": 0.0,
-            },
-        },
-        "rudder": {"angle": 0.0},
-        "motors": {"left": 0.0, "right": 0.0},
-        "power": {"motors": 0.0, "primary": 0.0},
-        "asv": {
-            "speed": 0.0,
-            "heading": 0.0,
-            "longitude": 0.0,
-            "latitude": 0.0,
-        },
-        "signal": {
-            "strength": 0.0,
-        },
         "zed": {
             "odom": {
                 "position": {"x": 0.0, "y": 0.0, "z": 0.0},

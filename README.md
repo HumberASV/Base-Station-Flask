@@ -130,7 +130,7 @@ step — sources ROS2, adds the pixi DLL path, sources the `cv_bridge`/`zed_msgs
 they've been built (skips them silently otherwise), and runs `ros2 launch basestation
 basestation.py`. Requires the `basestation` package to have been built first — see
 [INSTALL.md](INSTALL.md) / `.\build_basestation_pkg.ps1`. Supports `-Port`, `-BindHost`,
-`-Dashboard`, `-DebugMode`; run `Get-Help .\start_basestation.ps1 -Full` for details.
+`-Dashboard`, `-DebugMode`, `-Factory`; run `Get-Help .\start_basestation.ps1 -Full` for details.
 
 Otherwise, every new shell needs the ROS2 environment sourced **before** starting the app:
 
@@ -167,6 +167,7 @@ Command-line flags (all optional):
 | `--host` | `0.0.0.0` (or `$env:HOST`) | Interface to bind |
 | `--port` | `8080` (or `$env:PORT`) | Port to bind |
 | `--dashboard` | off | Enables the `/dashboard` debug page |
+| `--factory` | off (or `$env:FACTORY_MODE`) | Streams factory (fake) telemetry instead of connecting to ROS2/the ASV — see below |
 
 Environment variables:
 
@@ -175,10 +176,27 @@ Environment variables:
 | `HOST` / `PORT` | Fallback for `--host`/`--port` if flags aren't passed |
 | `FLASK_DEBUG=1` | Enables Flask's interactive debugger + reloader and `DEBUG`-level logging. **Never use in production** — it allows arbitrary code execution. |
 | `SECRET_KEY` | Flask session secret (defaults to a placeholder — set a real value for anything beyond local dev) |
+| `FACTORY_MODE=1` | Fallback for `--factory` if the flag isn't passed |
 
 If ROS2 isn't reachable (not sourced, `rclpy` unimportable, or no ASV on the network), the app
 does **not** crash — it logs `rclpy not found — ROS2 bridge disabled` and serves idle/default
 telemetry so the web client can still be exercised against zeros.
+
+For something more dynamic than zeros — e.g. exercising the web client's live-connection path
+end-to-end without ROS2 or a real ASV — pass `-Factory` (`.\start_basestation.ps1 -Factory`) or
+`--factory` (running `app.py` directly). This skips the ROS2 bridge entirely and instead runs a
+background thread that continuously randomizes `asv`, `battery`, `motors`, `rudder`, `signal`,
+and `zed.odom` (position mirrors `asv.longitude`/`asv.latitude`, same as the rest of the app
+treats it), and appends fake `task.log` entries, so the dashboard has something believable to
+render; `/video_feed` also falls back to the looped local clip in this mode.
+
+Factory mode also seeds `map.occupancyGrid` / `map.navigationGrid` and a BFS-planned
+`planning.course` / `planning.plan` at startup — a Python port of the same Gaussian-noise
+occupancy grid + pathfinding the web client's own `telemetryFactory.ts` uses for its standalone
+sim, so `map`/`planning.course`/`planning.plan` aren't just empty. It re-plots a fresh route on
+top of `asv`/`zed.odom` roughly every 25s, mimicking a new task being issued. `map.courseTrail`
+is deliberately left empty in every mode, factory included — it isn't part of the wire protocol;
+the web client builds it itself client-side from `zed.odom.position`.
 
 ## Verifying it's running
 

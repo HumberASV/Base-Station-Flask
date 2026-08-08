@@ -28,6 +28,11 @@ def validate_host_port(host: str, port: str) -> bool:
     return True
 
 
+def _truthy(value) -> bool:
+    """Parses CLI/env/launch-substitution strings ("true", "1", "yes", ...) as bool."""
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
 # ---------------------------------------------------------------------------
 # Parsing command line arguments
 # ---------------------------------------------------------------------------
@@ -36,12 +41,23 @@ parser = argparse.ArgumentParser(description="HumberASV Base Station Web Client"
 parser.add_argument("--host", type=str, default=os.getenv("HOST", "0.0.0.0"), help="Host to run the Flask app on (default: 0.0.0.0)")
 parser.add_argument("--port", type=int, default=int(os.getenv("PORT", 8080)), help="Port to run the Flask app on (default: 8080)")
 parser.add_argument("--dashboard", action="store_true", help="Enable dashboard mode")
+parser.add_argument(
+    "--factory",
+    type=str,
+    nargs="?",
+    const="true",
+    default=os.getenv("FACTORY_MODE", "false"),
+    help="Stream factory (fake) telemetry instead of the ROS2 bridge, so the web client has "
+         "something dynamic to render without a real ASV or ROS2 install. Pass alone as a bare "
+         "flag on the CLI, or with an explicit true/false value (used by the launch file).",
+)
 
 args, _ = parser.parse_known_args()  # ignore --ros-args etc. injected by `ros2 launch`
 
 HOST = args.host
 PORT = args.port
 DASHBOARD_MODE = args.dashboard
+FACTORY_MODE = _truthy(args.factory)
 
 # Check if the provided host and port are valid
 if not validate_host_port(HOST, str(PORT)):
@@ -74,7 +90,11 @@ FALLBACK_VIDEO_PATH = os.path.join(os.path.dirname(__file__), "assets", "video",
 _state_lock = threading.Lock()
 _telemetry_state: dict = telemetry_factory.make_default_state()
 
-ros2_bridge.start(_telemetry_state, _state_lock)
+if FACTORY_MODE:
+    logging.info("Factory mode enabled (--factory) — streaming fake telemetry, ROS2 bridge not started.")
+    telemetry_factory.start(_telemetry_state, _state_lock)
+else:
+    ros2_bridge.start(_telemetry_state, _state_lock)
 
 # Inject the video stream path so the WebSocket payload always includes it.
 _telemetry_state["video"] = {"streamUrl": STREAM_URL}
@@ -183,7 +203,10 @@ def _live_video_frames():
 
 @app.route("/video_feed")
 def video_feed():
-    frames = _live_video_frames() if ros2_bridge.is_ros2_available() else _fallback_video_frames()
+    # In factory mode there's no real camera behind ros2_bridge (its thread was never
+    # started), so always use the looped fallback clip even if rclpy itself is importable.
+    use_live = ros2_bridge.is_ros2_available() and not FACTORY_MODE
+    frames = _live_video_frames() if use_live else _fallback_video_frames()
     r = Response(frames, mimetype="multipart/x-mixed-replace; boundary=frame")
     r.headers["Access-Control-Allow-Origin"] = "*"
     return r

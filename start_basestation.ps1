@@ -30,6 +30,12 @@
     Enable Flask debug mode (FLASK_DEBUG=1) -- interactive debugger + reloader.
     Never use this in production.
 
+.PARAMETER Factory
+    Stream factory (fake) telemetry instead of connecting to ROS2/the ASV -- the ROS2 bridge
+    thread is never started, and a background thread continuously randomizes speed, heading,
+    position, battery, rudder, and signal so the web client has something dynamic to render
+    without real hardware. Also switches /video_feed to the looped fallback clip.
+
 .PARAMETER build
     Enable colcon build
 
@@ -45,6 +51,9 @@
     .\start_basestation.ps1 -Port 8081 -Dashboard
 
 .EXAMPLE
+    .\start_basestation.ps1 -Factory
+
+.EXAMPLE
     .\start_basestation.ps1 -CycloneDdsUri C:\dev\cyclonedds.xml
 #>
 [CmdletBinding()]
@@ -53,6 +62,7 @@ param(
     [string]$BindHost = "0.0.0.0",
     [switch]$Dashboard,
     [switch]$DebugMode,
+    [switch]$Factory,
     [string]$CycloneDdsUri = ""
 )
 
@@ -132,5 +142,9 @@ if (Test-Path $zedMsgsSetup) {
 if ($Dashboard) { Write-Warning "-Dashboard is not yet wired into launch/basestation.py (see TODO)." }
 if ($DebugMode) { $env:FLASK_DEBUG = "1" }
 
-Write-Step "Starting Base-Station-Flask on http://${BindHost}:${Port} (Ctrl+C to stop)"
-& ros2 launch basestation basestation.py "host:=$BindHost" "port:=$Port"
+$launchArgs = @("host:=$BindHost", "port:=$Port")
+if ($Factory) { $launchArgs += "factory:=true" }
+
+$modeNote = if ($Factory) { " [FACTORY MODE -- fake telemetry, no ROS2/ASV required]" } else { "" }
+Write-Step "Starting Base-Station-Flask on http://${BindHost}:${Port} (Ctrl+C to stop)$modeNote"
+& ros2 launch basestation basestation.py @launchArgs

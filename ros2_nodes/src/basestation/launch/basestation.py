@@ -7,6 +7,7 @@ from launch_ros.actions import Node
 def generate_launch_description():
     host = LaunchConfiguration("host")
     port = LaunchConfiguration("port")
+    factory = LaunchConfiguration("factory")
 
     annotated_node = Node(
         package="basestation",
@@ -18,7 +19,7 @@ def generate_launch_description():
         package="basestation",
         executable="flask",
         name="app",
-        arguments=["--host", host, "--port", port],
+        arguments=["--host", host, "--port", port, "--factory", factory],
     )
 
     return LaunchDescription([
@@ -26,6 +27,8 @@ def generate_launch_description():
                                description="Host IP addr"),
         DeclareLaunchArgument("port", default_value="8080",
                                description="Host port addr"),
+        DeclareLaunchArgument("factory", default_value="false",
+                               description="Stream factory (fake) telemetry instead of connecting to ROS2/the ASV"),
         # TODO(Carson): Launch description for isDashboard
         annotated_node,
         app_node,

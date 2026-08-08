@@ -33,18 +33,27 @@
 .PARAMETER build
     Enable colcon build
 
+.PARAMETER CycloneDdsUri
+    Path to a cyclonedds.xml config file. When passed, switches the DDS middleware from
+    Humble's default (Fast-RTPS) to Cyclone DDS for this process and everything it launches,
+    by setting RMW_IMPLEMENTATION=rmw_cyclonedds_cpp and CYCLONEDDS_URI to that file.
+
 .EXAMPLE
     .\start_basestation.ps1
 
 .EXAMPLE
     .\start_basestation.ps1 -Port 8081 -Dashboard
+
+.EXAMPLE
+    .\start_basestation.ps1 -CycloneDdsUri C:\dev\cyclonedds.xml
 #>
 [CmdletBinding()]
 param(
     [string]$Port = "8080",
     [string]$BindHost = "0.0.0.0",
     [switch]$Dashboard,
-    [switch]$DebugMode
+    [switch]$DebugMode,
+    [string]$CycloneDdsUri = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -85,6 +94,18 @@ if (Test-Path $ros2Setup) {
 }
 else {
     Write-Warning "ROS2 install not found at $Ros2Install -- starting in degraded (no-ROS2, mock telemetry) mode."
+}
+
+# 1b. (Optional) Switch DDS middleware to Cyclone DDS.
+if ($CycloneDdsUri) {
+    if (-not (Test-Path $CycloneDdsUri)) {
+        Write-Warning "cyclonedds.xml not found at $CycloneDdsUri -- CYCLONEDDS_URI will still be set, but Cyclone DDS will likely fail to start."
+    }
+    $resolved = Resolve-Path -Path $CycloneDdsUri -ErrorAction SilentlyContinue
+    $absolutePath = if ($resolved) { $resolved.Path } else { $CycloneDdsUri }
+    $env:RMW_IMPLEMENTATION = "rmw_cyclonedds_cpp"
+    $env:CYCLONEDDS_URI = "file:///$($absolutePath -replace '\\', '/')"
+    Write-Step "Using Cyclone DDS (CYCLONEDDS_URI=$($env:CYCLONEDDS_URI))"
 }
 
 # (optional build)

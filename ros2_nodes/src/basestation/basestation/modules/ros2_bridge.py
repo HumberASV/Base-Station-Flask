@@ -552,9 +552,12 @@ class _BaseStationNode(Node):
                 "label_id": int(obj.label_id),
                 "confidence": float(obj.confidence),
                 "position": {
-                    "x": float(obj.position.x),
-                    "y": float(obj.position.y),
-                    "z": float(obj.position.z),
+                    # obj.position is zed_msgs/Object's fixed-size `float32[3]` field,
+                    # which rosidl generates as a bare numpy.ndarray (no .x/.y/.z) —
+                    # index it instead of attribute-accessing it.
+                    "x": float(obj.position[0]),
+                    "y": float(obj.position[1]),
+                    "z": float(obj.position[2]),
                 },
             }
             for obj in msg.objects

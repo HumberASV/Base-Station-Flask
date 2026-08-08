@@ -79,6 +79,11 @@ ros2_bridge.start(_telemetry_state, _state_lock)
 # Inject the video stream path so the WebSocket payload always includes it.
 _telemetry_state["video"] = {"streamUrl": STREAM_URL}
 
+# Inject the list of topics the bridge subscribes to, so clients (e.g. the
+# visualizer's TaskData panel) can display which services/topics are active.
+# Static for the life of the process, same pattern as the video injection above.
+_telemetry_state["system"] = {"topics": ros2_bridge.get_available_topics()}
+
 
 @app.context_processor
 def inject_globals():

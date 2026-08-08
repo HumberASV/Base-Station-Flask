@@ -3,9 +3,11 @@ ROS2 bridge — subscribes to ASV topics and keeps shared telemetry state curren
 
 Topics consumed
 ---------------
-Phone  (std_msgs/Float32MultiArray)  [latitude, longitude, speed, heading]
-Task   (std_msgs/Float32MultiArray)  [action, target_heading, target_speed]
-zed    ()[odom, obj_det/objects, rgb/color/rect/image]
+phone              (std_msgs/Float32MultiArray)  [latitude, longitude, speed, heading]
+task               (std_msgs/Float32MultiArray)  [action, target_heading, target_speed]
+/asv/joint_states  (sensor_msgs/JointState)  prop_l_joint/prop_r_joint/rudder_joint fractions
+battery_status/*   (sensor_msgs/BatteryState)  prop_l, prop_r, main
+zed                ()[odom, obj_det/objects, rgb/color/rect/image]
 Factory fallback
 ----------------
 Subscriptions are created unconditionally.  If a topic hasn't delivered a
@@ -35,9 +37,11 @@ try:
     from cv_bridge import CvBridge
     log.debug("cv2, numpy, and cv_bridge are available — ZED image subscription enabled.")
     _CV2_OK = True
+    _CVBRIDGE_OK = True
 except ImportError:
     log.warning("cv2, numpy, or cv_bridge not found — ZED image subscription disabled.")
     _CV2_OK = False
+    _CVBRIDGE_OK = False
 
 ## Verify that the zed_interfaces package is available for ZED object detection. If not, the ZED object detection subscription will be disabled.
 try:
@@ -47,7 +51,7 @@ try:
     from rcl_interfaces.msg import Log as RosoutLog
     from std_msgs.msg import Float32MultiArray
     from nav_msgs.msg import Odometry
-    from sensor_msgs.msg import Image
+    from sensor_msgs.msg import Image, BatteryState, JointState
     log.debug("rclpy and ROS2 message types are available — ROS2 bridge enabled.")
     _ROS2_AVAILABLE = True
 except ImportError:
@@ -76,20 +80,23 @@ except ImportError:
 # and overwritten by annotated_udp_stream when it is also running.
 # Flask's /video_feed route reads from here.
 # ---------------------------------------------------------------------------
-_SAD_FRAME: bytes | None = None
-_sad_path = os.path.join(os.path.dirname(__file__), "images", "sad.jpg")
+_SAD_FRAME: bytes = None
+_sad_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "images", "sad.jpg")
 try:
     with open(_sad_path, "rb") as _f:
         _SAD_FRAME = _f.read()
 except OSError:
     log.warning("Could not load fallback image: %s", _sad_path)
 
-_latest_frame: bytes | None = _SAD_FRAME
+_latest_frame: bytes = _SAD_FRAME
 _frame_lock = threading.Lock()
 _frames_received: int = 0  # incremented each time _on_zed_image fires
 _spin_running: bool = False
 _spin_error: str = ""
 _spin_started_at: float = 0.0
+
+# not using pillow rn
+_PIL_OK = False
 
 log.info("ros2_bridge ready  cv2=%s  cv_bridge=%s  pil=%s  ros2=%s  sad_frame=%s",
          _CV2_OK, _CVBRIDGE_OK, _PIL_OK, _ROS2_AVAILABLE, _SAD_FRAME is not None)
@@ -106,7 +113,7 @@ def set_latest_frame(jpeg: bytes) -> None:
         _latest_frame = jpeg
 
 
-def get_latest_frame() -> bytes | None:
+def get_latest_frame() -> bytes:
     """
     Retrieve the latest JPEG frame buffer.
     Returns:
@@ -116,12 +123,25 @@ def get_latest_frame() -> bytes | None:
         return _latest_frame
 
 # Topic names for the ASV ROS2 topics consumed by the bridge.
-PHONE_TOPIC = "Phone"
-TASK_TOPIC = "Task"
+# NOTE: these must match Loon-E's actual publisher topic names exactly (ROS2
+# topic names are case-sensitive) — see src/loone/loone/phone.py and task.py.
+PHONE_TOPIC = "phone"
+TASK_TOPIC = "task"
+JOINT_STATES_TOPIC = "/asv/joint_states"
 ZED_ODOM_TOPIC = "zed/zed_node/odom"
 ZED_IMAGE_TOPIC = "/zed/zed_node/rgb/color/rect/image"
 ZED_OBJECTS_TOPIC = "zed/obj_det/objects"
 ROSOUT_TOPIC = "/rosout"
+
+# Servo-fraction -> degrees mapping for the rudder (sensor_msgs/JointState.position
+# on JOINT_STATES_TOPIC is a fraction in [0, 1], not a real angle — see busio_node.py /
+# thrust_mixer.py). RUDDER_CENTER_FRACTION mirrors thrust_mixer's `rudder_center`
+# parameter default (0.55 = straight ahead). RUDDER_MAX_DEG mirrors the maxRudderDeg=90
+# prop the website passes to ShipRudderVisualizerPanel. This is an approximation —
+# there is no real servo-fraction-to-degree calibration anywhere in the codebase yet;
+# it needs tuning against the actual rudder throw once on the water.
+RUDDER_CENTER_FRACTION = 0.55
+RUDDER_MAX_DEG = 90.0
 
 # Threshold in seconds for staleness detection of ASV topics. If a topic hasn't
 # delivered a message within this time, the bridge logs a warning and zeroes the
@@ -139,7 +159,7 @@ _ACTION_TO_STATUS = {
 }
 
 
-def _quat_to_rpy(x: float, y: float, z: float, w: float) -> tuple[float, float, float]:
+def _quat_to_rpy(x: float, y: float, z: float, w: float): #-> tuple[float, float, float]:
     """
     Convert quaternion to (roll, pitch, yaw) in radians.
     Args:
@@ -159,6 +179,18 @@ def _quat_to_rpy(x: float, y: float, z: float, w: float) -> tuple[float, float, 
     yaw = math.atan2(siny_cosp, cosy_cosp)
 
     return roll, pitch, yaw
+
+
+def _rudder_fraction_to_deg(fraction: float) -> float:
+    """
+    Map a rudder servo fraction in [0, 1] (RUDDER_CENTER_FRACTION = straight) to an
+    approximate angle in degrees, clamped to +/-RUDDER_MAX_DEG. See the module-level
+    comment on RUDDER_CENTER_FRACTION/RUDDER_MAX_DEG — this scaling is a placeholder
+    pending real on-water calibration.
+    """
+    span = max(RUDDER_CENTER_FRACTION, 1.0 - RUDDER_CENTER_FRACTION)
+    deg = (fraction - RUDDER_CENTER_FRACTION) / span * RUDDER_MAX_DEG
+    return max(-RUDDER_MAX_DEG, min(RUDDER_MAX_DEG, deg))
 
 
 def _append_log(log_list: list, entry: str) -> None:
@@ -224,13 +256,16 @@ def is_zed_available() -> bool:
     """
     return _ZED_MSGS_AVAILABLE
 
-def get_available_topics() -> list[str]:
+def get_available_topics(): #-> list[str]:
     """
     Get a list of available ROS2 topics that the bridge can subscribe to.
     Returns:
         A list of topic names that are available for subscription.
     """
-    topics = [PHONE_TOPIC, TASK_TOPIC, ZED_ODOM_TOPIC, ZED_IMAGE_TOPIC]
+    topics = [
+        PHONE_TOPIC, TASK_TOPIC, JOINT_STATES_TOPIC, ZED_ODOM_TOPIC, ZED_IMAGE_TOPIC,
+        "battery_status/prop_l", "battery_status/prop_r", "battery_status/main",
+    ]
     if _ZED_MSGS_AVAILABLE:
         topics.append(ZED_OBJECTS_TOPIC)
     return topics
@@ -258,6 +293,11 @@ class _BaseStationNode(Node):
         self._last_zed_odom = 0.0
         self._last_zed_image = 0.0
         self._last_zed_objects = 0.0
+        self._last_joint_states = 0.0
+        # Latest propulsion-battery percentages, averaged into state["battery"]["motors"]
+        # as each one reports (prop_l/prop_r are two independent BatteryState topics).
+        self._last_prop_l_pct = None
+        self._last_prop_r_pct = None
         self._bridge = CvBridge() if (_CV2_OK and _CVBRIDGE_OK) else None
         log.info("[ZED] cv2=%s cv_bridge=%s", _CV2_OK, _CVBRIDGE_OK)
         # Raw ROS2 ZED objects kept for annotation overlay (not serialized into state)
@@ -279,20 +319,75 @@ class _BaseStationNode(Node):
 
         self.create_subscription(Float32MultiArray, PHONE_TOPIC, self._on_phone, best_effort_qos)
         self.create_subscription(Float32MultiArray, TASK_TOPIC, self._on_task, best_effort_qos)
+        self.create_subscription(JointState, JOINT_STATES_TOPIC, self._on_joint_states, best_effort_qos)
         self.create_subscription(Odometry, ZED_ODOM_TOPIC, self._on_zed_odom, best_effort_qos)
         self.create_subscription(Image, ZED_IMAGE_TOPIC, self._on_zed_image, video_qos)
         self.create_subscription(RosoutLog, ROSOUT_TOPIC, self._on_rosout, reliable_qos)
+        self.create_subscription(BatteryState, "battery_status/prop_l", self._on_battery_prop_l, reliable_qos)
+        self.create_subscription(BatteryState, "battery_status/prop_r", self._on_battery_prop_r, reliable_qos)
+        self.create_subscription(BatteryState, "battery_status/main", self._on_battery_main, reliable_qos)
         if _ZED_MSGS_AVAILABLE:
             self.create_subscription(
                 ObjectsStamped, ZED_OBJECTS_TOPIC, self._on_zed_objects, reliable_qos
             )
 
         self.get_logger().info(
-            f"Subscribed to '{PHONE_TOPIC}', '{TASK_TOPIC}', '{ZED_ODOM_TOPIC}', "
-            f"'{ZED_IMAGE_TOPIC}'"
+            f"Subscribed to '{PHONE_TOPIC}', '{TASK_TOPIC}', '{JOINT_STATES_TOPIC}', "
+            f"'{ZED_ODOM_TOPIC}', '{ZED_IMAGE_TOPIC}', battery_status/{{prop_l,prop_r,main}}"
             + (f", '{ZED_OBJECTS_TOPIC}'" if _ZED_MSGS_AVAILABLE else " (ZED objects skipped — zed_msgs unavailable)")
             + ". Waiting for publishers…"
         )
+
+
+    def _update_motors_battery(self) -> None:
+        """Recompute state['battery']['motors'] as the average of whichever of the two
+        propulsion batteries (prop_l/prop_r) have reported so far."""
+        pcts = [p for p in (self._last_prop_l_pct, self._last_prop_r_pct) if p is not None]
+        if pcts:
+            self._state["battery"]["motors"] = sum(pcts) / len(pcts)
+
+    def _on_battery_prop_l(self, msg):
+        """Callback for the left propulsion (Dewalt) battery."""
+        pct = msg.percentage * 100.0
+        log.debug("[Battery/prop_l] voltage=%.2fV percentage=%.1f%%", msg.voltage, pct)
+        with self._lock:
+            self._last_prop_l_pct = pct
+            self._update_motors_battery()
+
+    def _on_battery_prop_r(self, msg):
+        """Callback for the right propulsion (Dewalt) battery."""
+        pct = msg.percentage * 100.0
+        log.debug("[Battery/prop_r] voltage=%.2fV percentage=%.1f%%", msg.voltage, pct)
+        with self._lock:
+            self._last_prop_r_pct = pct
+            self._update_motors_battery()
+
+    def _on_battery_main(self, msg):
+        """Callback for the primary (Blue Robotics) battery."""
+        pct = msg.percentage * 100.0
+        log.debug("[Battery/main] voltage=%.2fV percentage=%.1f%%", msg.voltage, pct)
+        with self._lock:
+            self._state["battery"]["primary"] = pct
+
+    # ------------------------------------------------------------------
+    # /asv/joint_states: prop_l_joint/prop_r_joint/rudder_joint fractions
+    # ------------------------------------------------------------------
+    def _on_joint_states(self, msg):
+        """
+        Callback for handling incoming actuator JointState echoes from busio_node.
+        """
+        with self._lock:
+            s = self._state
+            for name, position in zip(msg.name, msg.position):
+                fraction = float(position)
+                if name == "prop_l_joint":
+                    s["motors"]["left"] = fraction * 100.0
+                elif name == "prop_r_joint":
+                    s["motors"]["right"] = fraction * 100.0
+                elif name == "rudder_joint":
+                    s["rudder"]["angle"] = _rudder_fraction_to_deg(fraction)
+        log.debug("[JointStates] %s", dict(zip(msg.name, msg.position)))
+        self._last_joint_states = time.monotonic()
 
     # ------------------------------------------------------------------
     # Phone: [latitude, longitude, speed, heading]
@@ -512,8 +607,9 @@ class _BaseStationNode(Node):
                 self._state["zed"]["camera"]["active"] = False
                 _append_log(log_list, "WARNING: ZED camera feed lost.")
                 self._last_zed_image = now
-                if _SAD_FRAME is not None:
-                    set_latest_frame(_SAD_FRAME)
+                # Deliberately leave _latest_frame alone -- keep showing the last frame
+                # actually received rather than replacing it with a placeholder. sad.jpg
+                # is only ever the *initial* value, before any real frame has arrived.
 
 
 # ----------------------------------------------------------------------
@@ -552,7 +648,7 @@ def _spin_loop(state: dict, lock: threading.Lock) -> None:
         node.destroy_node()
         rclpy.shutdown()
 
-def start(state: dict, lock: threading.Lock) -> threading.Thread | None:
+def start(state: dict, lock: threading.Lock):# -> threading.Thread | None:
     """
     Start the ROS2 bridge in a daemon thread.
     Returns None (and does nothing) when ROS2 is not installed.

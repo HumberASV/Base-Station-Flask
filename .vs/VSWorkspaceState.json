@@ -1,0 +1,12 @@
+{
+  "ExpandedNodes": [
+    "",
+    "\\ros2_nodes",
+    "\\ros2_nodes\\src",
+    "\\ros2_nodes\\src\\flask_app",
+    "\\ros2_nodes\\src\\flask_app\\flask_app",
+    "\\ros2_nodes\\src\\flask_app\\flask_app\\modules"
+  ],
+  "SelectedNode": "\\ros2_nodes\\src",
+  "PreviewInSolutionExplorer": false
+}

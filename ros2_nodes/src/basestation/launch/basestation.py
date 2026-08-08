@@ -1,0 +1,32 @@
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument
+from launch.substitutions import LaunchConfiguration
+from launch_ros.actions import Node
+
+
+def generate_launch_description():
+    host = LaunchConfiguration("host")
+    port = LaunchConfiguration("port")
+
+    annotated_node = Node(
+        package="basestation",
+        executable="stream",
+        name="udp_stream",
+    )
+
+    app_node = Node(
+        package="basestation",
+        executable="flask",
+        name="app",
+        arguments=["--host", host, "--port", port],
+    )
+
+    return LaunchDescription([
+        DeclareLaunchArgument("host", default_value="0.0.0.0",
+                               description="Host IP addr"),
+        DeclareLaunchArgument("port", default_value="8080",
+                               description="Host port addr"),
+        # TODO(Carson): Launch description for isDashboard
+        annotated_node,
+        app_node,
+    ])

@@ -39,9 +39,9 @@ import logging
 log = logging.getLogger(__name__)
 
 try:
-    import ros2_bridge as _ros2_bridge
+    from basestation.modules import ros2_bridge as _ros2_bridge
     log.debug("ros2_bridge module imported successfully.")
-    
+
 except ImportError:
     _ros2_bridge = None  # type: ignore[assignment]
     log.warning("ros2_bridge module not found — annotated frames will not be shared with Flask.")
@@ -257,7 +257,7 @@ def main() -> None:
     ap.add_argument('--image-topic', default='/zed/zed_node/rgb/color/rect/image')
     ap.add_argument('--objects-topic', default='zed/obj_det/objects')
     ap.add_argument('--quality', type=int, default=80, metavar='1-100')
-    args = ap.parse_args()
+    args, _ = ap.parse_known_args()  # ignore --ros-args etc. injected by `ros2 launch`
 
     streamer = _UDPStreamer(args.port)
 

@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<CycloneDDS xmlns="https://cdds.io/config" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="https://cdds.io/config https://raw.githubusercontent.com/eclipse-cyclonedds/cyclonedds/master/etc/cyclonedds.xsd">
+  <Domain Id="any">
+    <General>
+      <Interfaces>
+        <NetworkInterface autodetermine="true" priority="default" multicast="false" />
+      </Interfaces>
+      <AllowMulticast>false</AllowMulticast><!-- Multicast disabled: incompatible with Tailscale -->
+      <MaxMessageSize>65500B</MaxMessageSize>
+    </General>
+    <Internal>
+      <Watermarks>
+        <WhcHigh>500kB</WhcHigh>
+      </Watermarks>
+      <SocketReceiveBufferSize min="10MB"/>
+    </Internal>
+    <Discovery>
+      <ParticipantIndex>auto</ParticipantIndex>
+      <MaxAutoParticipantIndex>120</MaxAutoParticipantIndex>
+      <Peers>
+        <Peer address="127.0.0.1"/><!-- required: intra-host DDS discovery between Docker containers -->
+        <Peer  address="192.168.137.1"/>
+        <Peer  address="192.168.137.47"/>
+        <!-- For multi-machine discovery over Tailscale (multicast disabled), add each remote machine's IP: -->
+        <!-- <Peer address="100.x.x.x"/>  (run `tailscale ip` on each machine to get the IP)               -->
+      </Peers>
+    </Discovery>
+
+  </Domain>
+</CycloneDDS>

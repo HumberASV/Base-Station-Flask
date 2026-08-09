@@ -151,13 +151,59 @@ def health():
 # WebSocket — telemetry stream
 # ---------------------------------------------------------------------------
 
+# Keys under `map` that are large and change rarely, so they are sent only when the map
+# actually changes rather than ~7x/second with everything else. `info` rides along because
+# `info.known` is a cols x rows boolean mask that changes with the grid.
+_HEAVY_MAP_KEYS = ("occupancyGrid", "navigationGrid", "info")
+
+
+def _serialise_state(state: dict, include_map: bool) -> str:
+    """
+    Serialises the telemetry state, optionally omitting the heavy map payload.
+
+    Omitting a key is safe because the web client merges leaf-wise over what it already
+    holds (see telemetrySlice's mergeChangedLeaves) — a key that isn't present simply
+    leaves the stored value untouched. The copies below are shallow and touch only the
+    `map` sub-dict, so this costs nothing next to the json.dumps it shrinks.
+    """
+    if include_map:
+        return json.dumps(state)
+    trimmed = dict(state)
+    trimmed["map"] = {k: v for k, v in state["map"].items() if k not in _HEAVY_MAP_KEYS}
+    return json.dumps(trimmed)
+
+
 @sock.route("/telemetry")
 def telemetry_ws(ws):
+    """
+    Streams telemetry at ~10 Hz, re-sending the occupancy map only when it changes.
+
+    This loop used to re-serialise the ENTIRE state on every tick, so the grid's size
+    multiplied straight into continuous bandwidth — which is what forced ros2_bridge to
+    downsample every map to a 48-cell board. Both producers *replace* the grid list when
+    the map changes (ros2_bridge._on_map assigns only after its own diff; the factory's
+    _apply_map assigns a fresh one) and neither ever mutates it in place, so object
+    identity is an exact and free change signal.
+
+    The previous list is held by reference rather than compared by `id()`: an id is just
+    an address, and a freed list's address can be reused by a new one, which would read
+    as "unchanged" and strand the client on a stale map. Holding the reference also keeps
+    that from happening in the first place.
+    """
+    last_grid = None
+    first = True
     try:
         while True:
             with _state_lock:
-                payload = json.dumps(_telemetry_state)
+                grid = _telemetry_state["map"].get("occupancyGrid")
+                # `first` covers a client connecting mid-session: it must receive the map
+                # in its opening frame even though nothing has changed since boot.
+                include_map = first or grid is not last_grid
+                payload = _serialise_state(_telemetry_state, include_map)
             ws.send(payload)
+            if include_map:
+                last_grid = grid
+                first = False
             time.sleep(0.1)
     except Exception:
         pass

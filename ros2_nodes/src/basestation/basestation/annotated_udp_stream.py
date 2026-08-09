@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """
+DEPRECATED USE ROS2_BRIDGE IN MODULES
 annotated_udp_stream.py — ZED annotated MJPEG stream over UDP.
 
 Subscribes to ZED camera image and object detection topics, draws 2D
@@ -75,11 +76,11 @@ except ImportError:
         def error(self, m): print(f'[ERR]  {m}')
 
 try:
-    from zed_interfaces.msg import ObjectsStamped
-    log.debug("zed_interfaces is available — ZED object detection subscription enabled.")
+    from zed_msgs.msg import ObjectsStamped
+    log.debug("zed_msgs is available — ZED object detection subscription enabled.")
     _ZED_OK = True
 except ImportError:
-    log.warning("zed_interfaces not found — ZED object detection topic will not be subscribed.")
+    log.warning("zed_msgs not found — ZED object detection topic will not be subscribed.")
     _ZED_OK = False
 
 # Constants for UDP frame protocol
@@ -254,8 +255,8 @@ def main() -> None:
     """
     ap = argparse.ArgumentParser(description='ZED annotated UDP stream')
     ap.add_argument('--port', type=int, default=9999)
-    ap.add_argument('--image-topic', default='/zed/zed_node/rgb/color/rect/image')
-    ap.add_argument('--objects-topic', default='zed/obj_det/objects')
+    ap.add_argument('--image-topic', default='/zedx/zed_node/rgb/color/rect/image')
+    ap.add_argument('--objects-topic', default='/zedx/obj_det/objects')
     ap.add_argument('--quality', type=int, default=80, metavar='1-100')
     args, _ = ap.parse_known_args()  # ignore --ros-args etc. injected by `ros2 launch`
 

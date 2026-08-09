@@ -113,9 +113,37 @@ if ($CycloneDdsUri) {
     }
     $resolved = Resolve-Path -Path $CycloneDdsUri -ErrorAction SilentlyContinue
     $absolutePath = if ($resolved) { $resolved.Path } else { $CycloneDdsUri }
+
     $env:RMW_IMPLEMENTATION = "rmw_cyclonedds_cpp"
-    $env:CYCLONEDDS_URI = "file:///$($absolutePath -replace '\\', '/')"
-    Write-Step "Using Cyclone DDS (CYCLONEDDS_URI=$($env:CYCLONEDDS_URI))"
+    $env:ROS_DOMAIN_ID=0
+
+
+    # Prefer constructing a proper file:// URI via the .NET System.Uri class so
+    # spaces and special characters are encoded correctly on Windows. Fall back
+    # to a simple file:/// conversion if Uri construction fails.
+    try {
+        $uri = (New-Object System.Uri($absolutePath)).AbsoluteUri
+    } catch {
+        $uri = "file:///$($absolutePath -replace '\\','/')"
+    }
+
+    # Also prepare a plain absolute-path fallback (some Cyclone builds on
+    # Windows accept a bare path instead of a file:// URI).
+    $plain = $absolutePath -replace '\\','/'
+
+    # On Windows, some Cyclone DDS builds prefer a plain absolute path
+    # rather than a file:// URI. Prefer the plain path when running on
+    # Windows; otherwise use the encoded file:// URI.
+    if ($env:OS -and $env:OS -match 'Windows') {
+        $env:CYCLONEDDS_URI = $plain
+        Write-Step "Using Cyclone DDS (CYCLONEDDS_URI=$($env:CYCLONEDDS_URI)) (plain path preferred on Windows)"
+        Write-Host "==> file-URI fallback: $uri" -ForegroundColor Cyan
+    }
+    else {
+        $env:CYCLONEDDS_URI = $uri
+        Write-Step "Using Cyclone DDS (CYCLONEDDS_URI=$($env:CYCLONEDDS_URI))"
+        if ($uri -ne $plain) { Write-Host "==> plain fallback path: $plain" -ForegroundColor Cyan }
+    }
 }
 
 # (optional build)
@@ -146,5 +174,5 @@ $launchArgs = @("host:=$BindHost", "port:=$Port")
 if ($Factory) { $launchArgs += "factory:=true" }
 
 $modeNote = if ($Factory) { " [FACTORY MODE -- fake telemetry, no ROS2/ASV required]" } else { "" }
-Write-Step "Starting Base-Station-Flask on http://${BindHost}:${Port} (Ctrl+C to stop)$modeNote"
+Write-Step "Starting Base-Station-Flask on http://192.168.137.1:${Port} (Ctrl+C to stop)$modeNote"
 & ros2 launch basestation basestation.py @launchArgs

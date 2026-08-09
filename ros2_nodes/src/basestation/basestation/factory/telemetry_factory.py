@@ -36,6 +36,37 @@ _LOG_MESSAGES = [
 # How often the factory thread mutates the shared state, in seconds.
 _TICK_S = 0.5
 
+# ---------------------------------------------------------------------------
+# Fake ZED object detection
+# ---------------------------------------------------------------------------
+# Labels the deployed ONNX model emits. It only knows buoys, except "otter",
+# which is a boat. Keep this list in sync with the visualizer's
+# OBJECT_COLOR_KEYS (src/utils/robot.ts) or detections render in the fallback
+# color.
+_OBJECT_LABELS = ["green", "red", "north", "east", "south", "west", "otter"]
+
+# Camera geometry, mirroring the visualizer's FOV_RADIUS_M / FOV_HALF_ANGLE_RAD
+# (src/utils/robot.ts) so what the maps draw as "in view" matches what actually
+# gets reported.
+_FOV_RADIUS_M = 40.0
+_FOV_HALF_ANGLE_RAD = math.pi / 6
+
+# The buoy field is a square tile repeated infinitely across the world, rather than
+# a finite patch. The vessel random-walks its heading and can drift hundreds of
+# metres over a long session, so a bounded field would be abandoned within minutes
+# and detections would stop for good. Tiling keeps a buoy at a given world position
+# permanently (the maps can still accumulate obstacles) while guaranteeing the
+# vessel is never outside the field.
+#
+# The tile must be more than 2x the FOV radius so each buoy has exactly one image
+# within sensing range — otherwise the same buoy could be seen twice at once.
+_FIELD_TILE_M = 120.0
+_FIELD_COUNT = 52
+
+# Buoys are 40 cm across and sit 20 cm above the waterline (see the ASV docs),
+# so a detection's z is reported at roughly deck height rather than 0.
+_BUOY_Z_M = 0.2
+
 
 def make_default_state() -> dict:
     """
@@ -48,6 +79,24 @@ def make_default_state() -> dict:
             "occupancyGrid": [],
             "navigationGrid": [],
             "courseTrail": [],
+            # Mirrors ros2_bridge's /map metadata so the client's grid-size and
+            # metres-per-cell handling is exercised identically in factory mode.
+            # The synthetic grid has no real scale, so 1 m per cell is asserted
+            # rather than measured.
+            #
+            # `origin` is the board's NORTH-WEST corner, matching the bridge's north-up
+            # convention (board +col = map +x/east, board +row = map -y/south). The
+            # synthetic map is declared to cover map-frame x in [0, 20], y in [0, 20],
+            # so its north-west corner is (0, 20).
+            "info": {
+                "cols": _GLOBAL_GRID_SIZE,
+                "rows": _GLOBAL_GRID_SIZE,
+                "resolution": _BOARD_RESOLUTION_M,
+                "origin": {"x": 0.0, "y": _GLOBAL_GRID_SIZE * _BOARD_RESOLUTION_M},
+            },
+            # Map-frame vessel pose. None until _tick computes one, mirroring the bridge's
+            # "no TF yet" state so the client's hide-the-vessel path is reachable here too.
+            "vesselPose": None,
         },
         "planning": {
             "status": "idle",
@@ -140,6 +189,15 @@ _CELL_OBJECTIVE = 4
 _CELL_ERROR = 5
 
 _GLOBAL_GRID_SIZE = 20              # react-isometric-engine GLOBAL_GRID_SIZE
+
+# Metres per synthetic board cell. Chosen so the 20x20 board spans exactly _FIELD_TILE_M,
+# which makes the two synthetic worlds — the board and the repeating buoy field — the same
+# size, and gives the vessel a leisurely ~60s crossing at typical factory speeds.
+#
+# Deliberately NOT 1.0: a unit resolution makes the client's metres<->cells conversion an
+# identity transform, so factory mode would happily pass while a real map (0.05 m/cell)
+# came out 20x wrong. A non-unit value here means the conversion is actually exercised.
+_BOARD_RESOLUTION_M = 6.0
 _FINE_SCALE = 5                     # GLOBAL_CELL_SIZE / LOCAL_CELL_SIZE (40 / 8)
 _FINE_GRID_SIZE = _GLOBAL_GRID_SIZE * _FINE_SCALE  # 100x100
 _FINE_SIGMA = _FINE_SCALE * 2.0     # visually equivalent to sigma=2 on the 20x20 grid
@@ -398,7 +456,120 @@ def _randomize_initial(state: dict) -> None:
     _append_log(state["task"]["log"], "[FACTORY] Factory telemetry stream started.")
 
 
-def _tick(state: dict) -> None:
+# Metres per degree of latitude. Good to ~0.1% anywhere, which is far inside the
+# fidelity anyone should expect from fake data.
+_METERS_PER_DEG_LAT = 111320.0
+
+
+def _generate_buoy_field(origin_lat: float, origin_lon: float) -> dict:
+    """
+    Scatters a fixed set of buoys around the starting position, in metres east/north
+    of it.
+
+    The field is generated ONCE and then held still in the world, which is the whole
+    point: the vessel moving through a stationary field is what makes detections
+    appear, drift across the bow and fall out of view again. Randomising positions
+    every tick would look busy but would exercise nothing — obstacles would never
+    hold still long enough for the maps to accumulate them.
+    """
+    marks = []
+    for i in range(_FIELD_COUNT):
+        marks.append({
+            "label": random.choice(_OBJECT_LABELS),
+            "label_id": i,
+            "east_m": random.uniform(0.0, _FIELD_TILE_M),
+            "north_m": random.uniform(0.0, _FIELD_TILE_M),
+        })
+    return {"origin_lat": origin_lat, "origin_lon": origin_lon, "marks": marks}
+
+
+def _wrap_delta(delta: float, span: float) -> float:
+    """
+    Maps an offset onto the nearest periodic image, in [-span/2, span/2).
+    Because the tile is wider than twice the sensing radius, at most one image of
+    any buoy can be in range, so this cannot produce duplicate detections.
+    """
+    return (delta + span / 2.0) % span - span / 2.0
+
+
+def _board_pose(state: dict, origin_lat: float, origin_lon: float) -> dict:
+    """
+    Places the factory's vessel on its synthetic board, in the same map-frame metres the
+    real bridge derives from the `map -> base_link` TF.
+
+    Without this, factory mode would exercise none of the client's pose handling — the
+    vessel would fall straight through to the "no map pose" path and never be drawn, and
+    the placement arithmetic (which is where a frame convention gets silently inverted)
+    would have nothing testing it short of a live ASV.
+
+    The position is taken modulo the board span. That is the *producer* being honest
+    about a world it admits is synthetic and endless: the factory random-walks its
+    heading forever and would abandon a 120 m board within a minute or two, leaving the
+    map empty. It is not the renderer wrapping a real pose, which is precisely what was
+    removed from live mode — a real SLAM map has edges and a boat that leaves the survey
+    must be seen to leave it.
+    """
+    asv = state["asv"]
+    cos_origin = math.cos(math.radians(origin_lat)) or 1e-9
+    north_m = (asv["latitude"] - origin_lat) * _METERS_PER_DEG_LAT
+    east_m = (asv["longitude"] - origin_lon) * _METERS_PER_DEG_LAT * cos_origin
+
+    span = _GLOBAL_GRID_SIZE * _BOARD_RESOLUTION_M
+    return {
+        "x": east_m % span,
+        "y": north_m % span,
+        "heading": asv["heading"],
+    }
+
+
+def _visible_objects(state: dict, field: dict) -> list:
+    """
+    Returns the subset of the buoy field currently inside the ZED's cone, expressed
+    boat-relative (x = right/starboard, y = forward) in metres — the same convention
+    the real `zed/obj_det/objects` bridge callback produces, so the web client cannot
+    tell the two apart.
+    """
+    asv = state["asv"]
+    cos_origin = math.cos(math.radians(field["origin_lat"])) or 1e-9
+
+    # Vessel offset from the field origin, in metres.
+    boat_north = (asv["latitude"] - field["origin_lat"]) * _METERS_PER_DEG_LAT
+    boat_east = (asv["longitude"] - field["origin_lon"]) * _METERS_PER_DEG_LAT * cos_origin
+
+    heading = asv["heading"]
+    visible = []
+
+    for mark in field["marks"]:
+        d_east = _wrap_delta(mark["east_m"] - boat_east, _FIELD_TILE_M)
+        d_north = _wrap_delta(mark["north_m"] - boat_north, _FIELD_TILE_M)
+        distance = math.hypot(d_east, d_north)
+        if distance > _FOV_RADIUS_M or distance < 1e-6:
+            continue
+
+        # Compass bearing to the mark (0 = north, 90 = east), then the bearing
+        # relative to where the bow is pointing, wrapped to [-180, 180].
+        bearing = math.degrees(math.atan2(d_east, d_north))
+        relative = (bearing - heading + 180.0) % 360.0 - 180.0
+        if abs(math.radians(relative)) > _FOV_HALF_ANGLE_RAD:
+            continue
+
+        rel_rad = math.radians(relative)
+        visible.append({
+            "label": mark["label"],
+            "label_id": mark["label_id"],
+            # Falls off with range, the way a real detector's does.
+            "confidence": round(max(0.35, 0.95 - (distance / _FOV_RADIUS_M) * 0.4), 3),
+            "position": {
+                "x": distance * math.sin(rel_rad),
+                "y": distance * math.cos(rel_rad),
+                "z": _BUOY_Z_M,
+            },
+        })
+
+    return visible
+
+
+def _tick(state: dict, field: dict | None = None) -> None:
     """Mutate `state` in place with one fake-telemetry step. Caller holds the lock."""
     asv = state["asv"]
     asv["heading"] = (asv["heading"] + _step(0.5, 4.0)) % 360.0
@@ -427,6 +598,13 @@ def _tick(state: dict) -> None:
     zed["position"]["y"] = asv["latitude"]
     zed["orientation"]["yaw"] = asv["heading"]
 
+    if field is not None:
+        state["zed"]["objects"] = _visible_objects(state, field)
+        state["zed"]["camera"]["active"] = True
+        # The field origin is the factory's one stable anchor lat/lon, so the board and
+        # the buoy field are measured from the same point and cannot drift apart.
+        state["map"]["vesselPose"] = _board_pose(state, field["origin_lat"], field["origin_lon"])
+
     if random.random() < 0.05:
         state["planning"]["status"] = random.choice(_TASK_STATUSES)
         state["task"]["data"]["status"] = state["planning"]["status"]
@@ -435,7 +613,7 @@ def _tick(state: dict) -> None:
         _append_log(state["task"]["log"], f"[FACTORY] {random.choice(_LOG_MESSAGES)}")
 
 
-def _loop(state: dict, lock: threading.Lock, interval: float) -> None:
+def _loop(state: dict, lock: threading.Lock, interval: float, field: dict) -> None:
     log.info("Factory telemetry thread running (interval=%.2fs)", interval)
     while True:
         time.sleep(interval)
@@ -443,7 +621,7 @@ def _loop(state: dict, lock: threading.Lock, interval: float) -> None:
         # part of a tick and shouldn't hold up /telemetry's reader thread.
         new_map = _generate_map_and_plan() if random.random() < _MAP_REGEN_CHANCE else None
         with lock:
-            _tick(state)
+            _tick(state, field)
             if new_map is not None:
                 _apply_map(state, new_map)
                 _append_log(state["task"]["log"], "[FACTORY] New task issued — course replotted.")
@@ -459,7 +637,11 @@ def start(state: dict, lock: threading.Lock, interval: float = _TICK_S) -> threa
     with lock:
         _randomize_initial(state)
         _apply_map(state, initial_map)
-    t = threading.Thread(target=_loop, args=(state, lock, interval), daemon=True, name="telemetry-factory")
+        # Anchor the buoy field to wherever the vessel starts, so it always begins
+        # somewhere the vessel can actually reach.
+        field = _generate_buoy_field(state["asv"]["latitude"], state["asv"]["longitude"])
+        _tick(state, field)
+    t = threading.Thread(target=_loop, args=(state, lock, interval, field), daemon=True, name="telemetry-factory")
     t.start()
-    log.info("Telemetry factory thread started.")
+    log.info("Telemetry factory thread started (%d buoys in field).", len(field["marks"]))
     return t

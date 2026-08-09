@@ -29,10 +29,21 @@ import math
 import os
 import threading
 import time
+import zlib
 
 ## Module-level logger
 log = logging.getLogger(__name__)
 
+## numpy is guarded on its own, separately from the cv2/cv_bridge block below, because
+## the /map conversion needs it and the ZED image path does not. Without this the
+## occupancy-grid vectorisation would be disabled by a missing cv_bridge, which has
+## nothing to do with it.
+try:
+    import numpy as np
+    _NUMPY_OK = True
+except ImportError:
+    _NUMPY_OK = False
+    log.warning("numpy not found — /map conversion falls back to the pure-Python path.")
 
 ## Verify that the cv2, numpy, and bridge packages are available for image processing. If not, the ZED image subscription will be disabled.
 try:
@@ -69,6 +80,7 @@ except ImportError:
         def __init__(self, *a, **kw): pass
         def get_logger(self): return log
         def create_subscription(self, *a, **kw): pass
+        def create_timer(self, *a, **kw): pass
         def destroy_node(self): pass
 
 try:
@@ -105,7 +117,10 @@ except OSError:
 
 _latest_frame: bytes = _SAD_FRAME
 _frame_lock = threading.Lock()
-_frames_received: int = 0  # incremented each time _on_zed_image fires
+# Bumped on every set_latest_frame. /video_feed uses it to tell "a new frame arrived"
+# from "the same frame is still the newest", so it can skip re-sending bytes the client
+# already has — the MJPEG generator polls faster than the camera publishes.
+_latest_frame_id: int = 0
 _spin_running: bool = False
 _spin_error: str = ""
 _spin_started_at: float = 0.0
@@ -123,9 +138,10 @@ def set_latest_frame(jpeg: bytes) -> None:
     Arguments:
         jpeg: The JPEG-encoded image data to store as the latest frame.
     """
-    global _latest_frame
+    global _latest_frame, _latest_frame_id
     with _frame_lock:
         _latest_frame = jpeg
+        _latest_frame_id += 1
 
 
 def get_latest_frame() -> bytes:
@@ -136,6 +152,18 @@ def get_latest_frame() -> bytes:
     """
     with _frame_lock:
         return _latest_frame
+
+
+def get_latest_frame_with_id() -> tuple:
+    """
+    Retrieve the latest JPEG frame along with its monotonic id.
+
+    Returns `(jpeg, frame_id)`. The id changes only when a genuinely new frame has been
+    buffered, letting the MJPEG generator poll at a fine interval — so a fresh frame goes
+    out promptly — without re-sending the same bytes on every poll.
+    """
+    with _frame_lock:
+        return _latest_frame, _latest_frame_id
 
 # Topic names for the ASV ROS2 topics consumed by the bridge.
 # NOTE: these must match Loon-E's actual publisher topic names exactly (ROS2
@@ -178,19 +206,28 @@ BASE_FRAME = os.getenv("BASE_FRAME", "base_link")
 CELL_EMPTY = 0
 CELL_OCCUPIED = 1
 
-# Optional longest-axis cap for the board sent to the client, aspect preserved.
-# 0 (the default) means no cap: send the map at its real resolution.
+# Longest-axis cap for the board sent to the client, aspect preserved. 0 disables the
+# cap and sends the map at its real resolution.
 #
-# This used to default to 48 because app.py re-serialised the ENTIRE telemetry state on
-# every websocket tick (~7 Hz), so grid size multiplied straight into *continuous*
-# bandwidth. app.py now sends the grid only when it actually changes, which removes that
-# multiplier and makes an uncapped map affordable.
+# History: this defaulted to 48 because app.py re-serialised the ENTIRE telemetry state
+# on every websocket tick (~7 Hz), so grid size multiplied straight into *continuous*
+# bandwidth. app.py then started sending the grid only when it actually changes, and the
+# default was relaxed to 0 on the reasoning that the remaining cost is paid only per map
+# change.
 #
-# The cost has not vanished, it has moved: it is now paid per *map change*, and SLAM
-# Toolbox revises the map repeatedly while surveying. At the current one-dict-per-cell
-# encoding a 500x500 map is roughly 7 MB per update. Set MAP_MAX_AXIS to a positive
-# number to trade detail for wire size on a slow link — 128 is ~290 KB, 48 is ~40 KB.
-MAP_MAX_AXIS = int(os.getenv("MAP_MAX_AXIS", "0"))
+# That reasoning accounted for bytes but not for CPU, and CPU is what actually hurt.
+# _occupancy_grid_to_cells allocates one dict per output cell, and until the conversion
+# moved to its own thread it ran on the same single-threaded rclpy executor that services
+# the ZED camera callback. SLAM Toolbox republishes /map every 5 s (map_update_interval)
+# at 0.05 m/cell, so a 40 m x 40 m survey is an 800x800 board = 640,000 dicts every five
+# seconds — which stalled the video feed for seconds at a time, on a Wi-Fi link that had
+# no headroom to spare.
+#
+# 128 is therefore the default: ~16k cells, roughly 290 KB on the wire, and a conversion
+# that finishes in milliseconds. Raise it (or set 0) when the link and the CPU can take
+# it — the work is off the callback thread now, so an uncapped map no longer starves the
+# camera, it just costs bandwidth and client-side render time. 48 is ~40 KB.
+MAP_MAX_AXIS = int(os.getenv("MAP_MAX_AXIS", "128"))
 
 # nav_msgs/OccupancyGrid data is int8: -1 unknown, else 0-100 occupancy probability.
 # Anything at or above this is treated as an obstacle. 65 is the usual SLAM Toolbox
@@ -210,6 +247,80 @@ def _board_dims(width: int, height: int) -> tuple:
         return width, height
     scale = MAP_MAX_AXIS / longest
     return max(1, int(round(width * scale))), max(1, int(round(height * scale)))
+
+
+def _reduce_occupancy_np(data, width: int, height: int, rows: int, cols: int) -> tuple:
+    """
+    Block-reduces an OccupancyGrid's cells down to a `rows` x `cols` board with numpy.
+
+    Returns `(occupied, known)`, each a `rows`-long list of `cols`-long bool lists,
+    already flipped north-up. A coarse cell is occupied if ANY source cell in its
+    footprint is at or above OCCUPANCY_THRESHOLD, and known if ANY is non-negative —
+    the same rule as _reduce_occupancy_py, which this must stay bit-identical to.
+    """
+    src = np.asarray(data, dtype=np.int8)
+    if src.size < width * height:
+        raise ValueError(f"OccupancyGrid data too short: {src.size} < {width * height}")
+    src = src[: width * height].reshape(height, width)
+
+    # Block boundaries, using the same integer arithmetic as the scalar path so the two
+    # agree cell for cell. _board_dims never upsamples, so rows <= height and cols <=
+    # width, which makes these strictly increasing — what reduceat needs to reduce a real
+    # span per output rather than passing a lone element through.
+    row_starts = np.arange(rows, dtype=np.intp) * height // rows
+    col_starts = np.arange(cols, dtype=np.intp) * width // cols
+
+    def _blocks(mask):
+        # max over a boolean block is logical-or, i.e. "any source cell qualifies".
+        return np.maximum.reduceat(
+            np.maximum.reduceat(mask, row_starts, axis=0), col_starts, axis=1
+        )
+
+    # Source row 0 is the SOUTHERN edge and the board is emitted north-up, so reverse.
+    # See the axis convention in _occupancy_grid_to_cells' docstring — this flip is
+    # required, not cosmetic.
+    return _blocks(src >= OCCUPANCY_THRESHOLD)[::-1].tolist(), _blocks(src >= 0)[::-1].tolist()
+
+
+def _reduce_occupancy_py(data, width: int, height: int, rows: int, cols: int) -> tuple:
+    """
+    Pure-Python fallback for _reduce_occupancy_np, used when numpy is unavailable.
+
+    Same contract and same output. Kept because numpy is an optional dependency here —
+    it arrives with the cv2/cv_bridge stack, which a ROS2-less install does not have.
+    """
+    occupied_out, known_out = [], []
+    for row in range(rows):
+        # Source rows covered by this output row, counted from the NORTH edge.
+        flipped = rows - 1 - row
+        src_r0 = (flipped * height) // rows
+        src_r1 = max(src_r0 + 1, ((flipped + 1) * height) // rows)
+        occ_row, known_row = [], []
+        for col in range(cols):
+            src_c0 = (col * width) // cols
+            src_c1 = max(src_c0 + 1, ((col + 1) * width) // cols)
+
+            occupied = False
+            known = False
+            for sr in range(src_r0, min(src_r1, height)):
+                base = sr * width
+                for sc in range(src_c0, min(src_c1, width)):
+                    v = data[base + sc]
+                    # -1 is "never observed". Any non-negative reading means SLAM has
+                    # actually seen this patch, whether or not something is in it.
+                    if v >= 0:
+                        known = True
+                    if v >= OCCUPANCY_THRESHOLD:
+                        occupied = True
+                        break
+                if occupied:
+                    break
+
+            occ_row.append(occupied)
+            known_row.append(known)
+        occupied_out.append(occ_row)
+        known_out.append(known_row)
+    return occupied_out, known_out
 
 
 def _occupancy_grid_to_cells(msg) -> tuple:
@@ -252,50 +363,33 @@ def _occupancy_grid_to_cells(msg) -> tuple:
         return [], None
 
     cols, rows = _board_dims(width, height)
-    data = msg.data
 
-    grid = []
+    reduce_fn = _reduce_occupancy_np if _NUMPY_OK else _reduce_occupancy_py
+    occupied, known = reduce_fn(msg.data, width, height, rows, cols)
+
+    grid = [
+        [
+            {
+                "type": CELL_OCCUPIED if occ else CELL_EMPTY,
+                "x": col,
+                "y": row,
+                "z": 0.0,
+            }
+            for col, occ in enumerate(occ_row)
+        ]
+        for row, occ_row in enumerate(occupied)
+    ]
+
     # Flat row-major "has SLAM actually observed this cell" mask. Needed because the
     # downsample collapses OccupancyGrid's -1 (unknown) and 0 (known-clear) into the same
     # CELL_EMPTY, leaving the client unable to tell unsurveyed water from open water —
     # without it, fog-of-war either hides known-clear cells or reveals the entire map.
-    # Appended inside the same loop as the cells, so it inherits the north-up flip.
-    known_mask: list = []
-    for row in range(rows):
-        # Source rows covered by this output row, counted from the NORTH edge — see the
-        # axis convention above.
-        flipped = rows - 1 - row
-        src_r0 = (flipped * height) // rows
-        src_r1 = max(src_r0 + 1, ((flipped + 1) * height) // rows)
-        row_cells = []
-        for col in range(cols):
-            src_c0 = (col * width) // cols
-            src_c1 = max(src_c0 + 1, ((col + 1) * width) // cols)
-
-            occupied = False
-            known = False
-            for sr in range(src_r0, min(src_r1, height)):
-                base = sr * width
-                for sc in range(src_c0, min(src_c1, width)):
-                    v = data[base + sc]
-                    # -1 is "never observed". Any non-negative reading means SLAM has
-                    # actually seen this patch, whether or not something is in it.
-                    if v >= 0:
-                        known = True
-                    if v >= OCCUPANCY_THRESHOLD:
-                        occupied = True
-                        break
-                if occupied:
-                    break
-
-            known_mask.append(known or occupied)
-            row_cells.append({
-                "type": CELL_OCCUPIED if occupied else CELL_EMPTY,
-                "x": col,
-                "y": row,
-                "z": 0.0,
-            })
-        grid.append(row_cells)
+    # Built from the same north-up arrays as the cells, so it inherits the row flip.
+    known_mask: list = [
+        k or o
+        for known_row, occ_row in zip(known, occupied)
+        for k, o in zip(known_row, occ_row)
+    ]
 
     src_res = float(msg.info.resolution) if msg.info.resolution else 0.0
     info = {
@@ -341,6 +435,12 @@ _POSE_STALE_THRESHOLD_S = 3.0
 # Seconds between repeats of the "no TF yet" warning. A missing map->base_link is the
 # normal state before SLAM converges, so this must not spam the log at spin rate.
 _TF_WARN_INTERVAL_S = 30.0
+# How often tick() polls TF and re-checks staleness. This used to run once per
+# spin_once(), i.e. after every message however cheap, which meant a TF lookup and a lock
+# acquisition per callback at whatever rate the busiest topic happened to publish. On a
+# timer the cost is fixed and predictable instead. Must stay well under the tightest
+# threshold above (_POSE_STALE_THRESHOLD_S, 3 s) so staleness is still caught promptly.
+_TICK_PERIOD_S = 0.5
 
 # Maximum number of log entries to keep in the rolling log for each topic.
 _LOG_MAX = 50
@@ -398,6 +498,48 @@ def _append_log(log_list: list, entry: str) -> None:
         log_list.append(entry)
     if len(log_list) > _LOG_MAX:
         del log_list[:-_LOG_MAX]
+
+def _jpeg_dimensions(data: bytes):
+    """
+    Reads (width, height) out of a JPEG's SOF segment without decoding the image.
+
+    _on_zed_image's passthrough path forwards the camera's JPEG untouched, so it never
+    builds a pixel buffer to measure — but the client still wants zed.camera.width/height.
+    Walking the segment headers costs microseconds against the ~10-30 ms a full decode
+    would cost purely to read two numbers.
+
+    Returns None when the data is not a JPEG this can parse, in which case the caller
+    leaves the last known dimensions in place rather than publishing a guess.
+    """
+    n = len(data)
+    if n < 4 or data[0] != 0xFF or data[1] != 0xD8:
+        return None
+    i = 2
+    while i + 3 < n:
+        if data[i] != 0xFF:
+            i += 1
+            continue
+        marker = data[i + 1]
+        # Padding, SOI and the standalone RSTn markers carry no length field.
+        if marker in (0xFF, 0x01, 0xD8) or 0xD0 <= marker <= 0xD7:
+            i += 2
+            continue
+        # Start of scan / end of image — past here is entropy-coded data, no SOF to find.
+        if marker in (0xDA, 0xD9):
+            return None
+        seg_len = (data[i + 2] << 8) | data[i + 3]
+        # SOF0..SOF15 carry the frame dimensions. C4/C8/CC share the range but are
+        # DHT/JPG/DAC, which do not.
+        if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+            if i + 9 > n:
+                return None
+            return ((data[i + 7] << 8) | data[i + 8],   # width
+                    (data[i + 5] << 8) | data[i + 6])   # height
+        if seg_len < 2:
+            return None
+        i += 2 + seg_len
+    return None
+
 
 def _to_bgr_cv2(frame: "np.ndarray", enc: str) -> "np.ndarray":
     if enc in ('bgra8', 'bgra'):
@@ -499,9 +641,15 @@ class _BaseStationNode(Node):
         self._last_tf_warn = 0.0
         self._last_tf_stamp = None
         self._pose_seen = False
-        # Previous converted board, kept so an unchanged /map republish is dropped
-        # instead of re-serialised — see _on_map.
-        self._last_map_grid = None
+        # Fingerprint of the last /map message accepted, so an unchanged republish is
+        # dropped before any conversion work happens — see _map_key / _on_map.
+        self._last_map_key = None
+        # Single-slot handoff to the map worker thread. Single-slot on purpose: a burst
+        # of republishes collapses to the newest, which is the only one worth drawing.
+        self._map_pending = None
+        self._map_pending_lock = threading.Lock()
+        self._map_wakeup = threading.Event()
+        self._map_worker_stop = False
         self._scan_seen = False
         # Latest propulsion-battery percentages, averaged into state["battery"]["motors"]
         # as each one reports (prop_l/prop_r are two independent BatteryState topics).
@@ -519,10 +667,22 @@ class _BaseStationNode(Node):
             reliability=QoSReliabilityPolicy.BEST_EFFORT,
             durability=QoSDurabilityPolicy.VOLATILE,
         )
-        # ZED image publisher uses RELIABLE — match it so DDS negotiation always succeeds
+        # BEST_EFFORT, even though the ZED image publisher offers RELIABLE. That is not a
+        # mismatch: DDS pairs a reader and writer when the OFFERED reliability is at least
+        # the REQUESTED one, and BEST_EFFORT < RELIABLE, so a best-effort subscription
+        # matches a reliable publisher. Only the reverse — reliable reader, best-effort
+        # writer — fails to match.
+        #
+        # It must be BEST_EFFORT because these frames cross the Wi-Fi hotspot link from
+        # the ASV, and cyclonedds.xml caps MaxMessageSize at 65500B so every frame is
+        # fragmented into several datagrams. Under RELIABLE a single lost fragment holds
+        # the whole sample back until it has been NACKed and retransmitted; on a marginal
+        # link that backlog compounds and the feed ends up permanently seconds behind.
+        # BEST_EFFORT discards the incomplete frame and delivers the next fresh one, which
+        # is what live video actually wants. annotated_udp_stream.py made the same choice.
         video_qos = QoSProfile(
             depth=1,
-            reliability=QoSReliabilityPolicy.RELIABLE,
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
             durability=QoSDurabilityPolicy.VOLATILE,
         )
         # SLAM Toolbox latches /map as RELIABLE + TRANSIENT_LOCAL. A VOLATILE
@@ -558,6 +718,19 @@ class _BaseStationNode(Node):
         # tears down those subscriptions and the buffer silently stops filling.
         self._tf_buffer = Buffer() if _TF2_AVAILABLE else None
         self._tf_listener = TransformListener(self._tf_buffer, self) if _TF2_AVAILABLE else None
+
+        # Staleness/TF polling on a fixed timer rather than after every spin_once —
+        # see _TICK_PERIOD_S.
+        self.create_timer(_TICK_PERIOD_S, self.tick)
+
+        # /map conversion runs here, off the executor thread. Even vectorised it allocates
+        # one dict per board cell, and the executor is single-threaded: anything slow on
+        # it stops servicing the ZED camera callback, which is exactly how a five-second
+        # SLAM republish turned into a five-second video freeze.
+        self._map_worker = threading.Thread(
+            target=self._map_worker_loop, daemon=True, name="map-convert"
+        )
+        self._map_worker.start()
 
         self.get_logger().info(
             f"Subscribed to '{PHONE_TOPIC}', '{TASK_TOPIC}', '{JOINT_STATES_TOPIC}', "
@@ -699,17 +872,42 @@ class _BaseStationNode(Node):
         Callback for handling incoming ZED RGB image messages.
 
         The topic is already JPEG-compressed (sensor_msgs/CompressedImage), so
-        msg carries only header/format/data — no width, height or encoding. It
-        is decoded here solely so the object-detection overlay can be drawn on
-        top; the result is re-encoded for the MJPEG stream.
+        msg carries only header/format/data — no width, height or encoding.
+
+        Decoding is therefore only worth doing when there is an object-detection overlay
+        to draw. With no boxes pending the payload is forwarded byte for byte: a decode
+        plus a re-encode costs ~10-30 ms on the executor thread and re-compresses an
+        already-lossy image for a result the client cannot tell apart. Dimensions come
+        from the JPEG header instead — see _jpeg_dimensions.
         """
-        if not _CV2_OK:
-            log.warning("[ZED/image] cv2 unavailable — frame dropped")
+        payload = bytes(msg.data)
+        self._last_zed_image = time.monotonic()
+
+        with self._raw_objects_lock:
+            objects = list(self._raw_objects)
+
+        if not objects:
+            dims = _jpeg_dimensions(payload)
+            with self._lock:
+                cam = self._state["zed"]["camera"]
+                cam["active"] = True
+                cam["encoding"] = msg.format
+                if dims is not None:
+                    cam["width"], cam["height"] = int(dims[0]), int(dims[1])
+            set_latest_frame(payload)
+            log.debug("[ZED/image] passthrough %d bytes", len(payload))
             return
 
-        frame = cv2.imdecode(
-            np.frombuffer(bytes(msg.data), dtype=np.uint8), cv2.IMREAD_COLOR
-        )
+        if not _CV2_OK:
+            # Nothing can be drawn without cv2, but the frame itself is still good —
+            # forward it rather than dropping it and stalling the feed.
+            with self._lock:
+                self._state["zed"]["camera"]["active"] = True
+            set_latest_frame(payload)
+            log.warning("[ZED/image] cv2 unavailable — forwarding frame without overlay")
+            return
+
+        frame = cv2.imdecode(np.frombuffer(payload, dtype=np.uint8), cv2.IMREAD_COLOR)
         if frame is None:
             log.warning("[ZED/image] imdecode failed (format=%s) — frame dropped", msg.format)
             return
@@ -721,15 +919,13 @@ class _BaseStationNode(Node):
             cam["width"] = int(width)
             cam["height"] = int(height)
             cam["encoding"] = msg.format
-        self._last_zed_image = time.monotonic()
 
-        with self._raw_objects_lock:
-            _draw_ros_objects(frame, list(self._raw_objects))
+        _draw_ros_objects(frame, objects)
 
         ok, buf = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
         if ok:
             set_latest_frame(buf.tobytes())
-            log.debug("[ZED/image] buffered %d bytes", buf.size)
+            log.debug("[ZED/image] annotated %d bytes", buf.size)
         else:
             log.warning("[ZED/image] imencode failed — frame dropped")
 
@@ -821,37 +1017,92 @@ class _BaseStationNode(Node):
     # ------------------------------------------------------------------
     # /map  (nav_msgs/OccupancyGrid) — SLAM Toolbox's global map
     # ------------------------------------------------------------------
+    @staticmethod
+    def _map_key(msg) -> tuple:
+        """
+        Cheap fingerprint of an OccupancyGrid, used to drop unchanged republishes.
+
+        A CRC over the raw int8 cells plus the geometry that gives them meaning. This
+        replaced comparing the *converted* board dict by dict, which had the fast path
+        backwards: it did the expensive conversion first and only then discovered nothing
+        had changed. SLAM Toolbox republishes /map on a timer whether or not anything
+        moved, so that is the common case, and it now costs one C-speed pass.
+        """
+        info = msg.info
+        return (
+            int(info.width),
+            int(info.height),
+            round(float(info.resolution), 6),
+            round(float(info.origin.position.x), 6),
+            round(float(info.origin.position.y), 6),
+            zlib.crc32(bytes(msg.data)),
+        )
+
     def _on_map(self, msg):
         """
-        Converts SLAM Toolbox's global map into the client's coarse Grid.
+        Hands SLAM Toolbox's global map to the worker thread that converts it.
 
-        Only re-serialises when the map actually changes. SLAM Toolbox republishes
-        /map on a timer whether or not anything moved, and this conversion walks
-        every source cell — at map sizes of a few hundred squared that is far too
-        much work to redo for an identical map, and it would also hand the web
-        client a fresh array identity on every republish.
+        Deliberately does no conversion work itself: this runs on the single-threaded
+        executor shared with the ZED camera callback, and the conversion allocates a dict
+        per board cell. Doing it inline is what made the video freeze for seconds every
+        time SLAM republished.
         """
         try:
-            grid, info = _occupancy_grid_to_cells(msg)
+            key = self._map_key(msg)
         except Exception:
-            log.exception("[/map] failed to convert OccupancyGrid")
+            log.exception("[/map] failed to fingerprint OccupancyGrid")
             return
 
-        if not grid:
-            return
-
-        if grid == self._last_map_grid:
-            self._last_map = time.monotonic()
-            return
-
-        self._last_map_grid = grid
-        log.info("[/map] %dx%d @ %.3f m/cell -> %dx%d board @ %.3f m/cell",
-                 msg.info.width, msg.info.height, msg.info.resolution,
-                 info["cols"], info["rows"], info["resolution"])
-        with self._lock:
-            self._state["map"]["occupancyGrid"] = grid
-            self._state["map"]["info"] = info
         self._last_map = time.monotonic()
+        if key == self._last_map_key:
+            return
+        self._last_map_key = key
+
+        with self._map_pending_lock:
+            self._map_pending = msg
+        self._map_wakeup.set()
+
+    def _map_worker_loop(self) -> None:
+        """
+        Converts whatever /map message is pending, forever, off the executor thread.
+
+        Takes the newest pending message and discards any it superseded — an older map is
+        never worth drawing once a newer one exists. The 1 s wait timeout is what lets the
+        thread notice _map_worker_stop during shutdown.
+        """
+        while not self._map_worker_stop:
+            if not self._map_wakeup.wait(timeout=1.0):
+                continue
+            self._map_wakeup.clear()
+
+            with self._map_pending_lock:
+                msg, self._map_pending = self._map_pending, None
+            if msg is None:
+                continue
+
+            started = time.monotonic()
+            try:
+                grid, info = _occupancy_grid_to_cells(msg)
+            except Exception:
+                log.exception("[/map] failed to convert OccupancyGrid")
+                continue
+            if not grid:
+                continue
+
+            log.info("[/map] %dx%d @ %.3f m/cell -> %dx%d board @ %.3f m/cell (%.1f ms)",
+                     msg.info.width, msg.info.height, msg.info.resolution,
+                     info["cols"], info["rows"], info["resolution"],
+                     (time.monotonic() - started) * 1000.0)
+            # Assign rather than mutate: app.py's websocket loop uses the grid's object
+            # identity to decide when to re-send the heavy map keys.
+            with self._lock:
+                self._state["map"]["occupancyGrid"] = grid
+                self._state["map"]["info"] = info
+
+    def shutdown(self) -> None:
+        """Stops the map worker. Called from _spin_loop's teardown."""
+        self._map_worker_stop = True
+        self._map_wakeup.set()
 
     # ------------------------------------------------------------------
     # /scan  (sensor_msgs/LaserScan) — raw lidar
@@ -1033,6 +1284,8 @@ def _spin_loop(state: dict, lock: threading.Lock) -> None:
         state: Shared telemetry state dictionary to update.
         lock: Threading lock for synchronizing access to the state.
     """
+    global _spin_running, _spin_error, _spin_started_at
+
     try:
         rclpy.init()
     except Exception as exc:
@@ -1045,9 +1298,9 @@ def _spin_loop(state: dict, lock: threading.Lock) -> None:
     _spin_running = True
     log.info("ROS2 spin loop running (topic=%s)", ZED_IMAGE_TOPIC)
     try:
-        while rclpy.ok():
-            rclpy.spin_once(node, timeout_sec=1.0)
-            node.tick()
+        # Plain spin: staleness/TF polling is a node timer now (see _TICK_PERIOD_S), so
+        # there is no longer per-iteration work to interleave by hand.
+        rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     except Exception as exc:
@@ -1055,6 +1308,7 @@ def _spin_loop(state: dict, lock: threading.Lock) -> None:
         log.error("ROS2 spin error: %s", _spin_error)
     finally:
         _spin_running = False
+        node.shutdown()
         node.destroy_node()
         rclpy.shutdown()
 

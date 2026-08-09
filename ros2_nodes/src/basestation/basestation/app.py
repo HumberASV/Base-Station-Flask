@@ -165,12 +165,16 @@ def _serialise_state(state: dict, include_map: bool) -> str:
     holds (see telemetrySlice's mergeChangedLeaves) — a key that isn't present simply
     leaves the stored value untouched. The copies below are shallow and touch only the
     `map` sub-dict, so this costs nothing next to the json.dumps it shrinks.
+
+    `separators` drops json.dumps' default `", "` / `": "` padding. On a payload sent ~10
+    times a second that whitespace is pure overhead — nothing downstream reads the JSON
+    by eye, and JSON.parse does not care.
     """
     if include_map:
-        return json.dumps(state)
+        return json.dumps(state, separators=(",", ":"))
     trimmed = dict(state)
     trimmed["map"] = {k: v for k, v in state["map"].items() if k not in _HEAVY_MAP_KEYS}
-    return json.dumps(trimmed)
+    return json.dumps(trimmed, separators=(",", ":"))
 
 
 @sock.route("/telemetry")
@@ -235,16 +239,31 @@ def _fallback_video_frames():
             cap.release()
 
 
+# How often the MJPEG generator checks for a new frame. Much finer than any camera's
+# frame interval on purpose: the loop only *sends* when the frame id changes, so polling
+# often just means a fresh frame goes out promptly instead of waiting out a fixed sleep.
+_VIDEO_POLL_S = 0.005
+
+
 def _live_video_frames():
-    """Streams the latest JPEG frame from the ROS2 bridge / annotated_udp_stream buffer."""
+    """
+    Streams the latest JPEG frame from the ROS2 bridge / annotated_udp_stream buffer.
+
+    Sends each frame exactly once. This used to yield on a fixed 0.033 s tick regardless
+    of whether the buffer had changed, so a 15 fps camera still pushed 30 fps of bytes —
+    half of them a byte-for-byte repeat of what the client had already decoded.
+    """
+    last_id = None
     while True:
-        frame = ros2_bridge.get_latest_frame()
-        if frame is not None:
+        frame, frame_id = ros2_bridge.get_latest_frame_with_id()
+        if frame is not None and frame_id != last_id:
+            last_id = frame_id
             yield (
                 b"--frame\r\n"
                 b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
             )
-        time.sleep(0.033)  # cap at ~30 fps
+            continue
+        time.sleep(_VIDEO_POLL_S)
 
 
 @app.route("/video_feed")

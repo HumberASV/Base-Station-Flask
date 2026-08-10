@@ -634,7 +634,8 @@ class _BaseStationNode(Node):
         self._last_zed_odom = 0.0
         self._last_zed_image = 0.0
         self._last_zed_objects = 0.0
-        self._last_joint_states = 0.0
+        #self._last_joint_states = 0.0
+        self._last_motor_state = 0.0
         self._last_map = 0.0
         self._last_scan = 0.0
         self._last_pose = 0.0
@@ -697,7 +698,10 @@ class _BaseStationNode(Node):
 
         self.create_subscription(Float32MultiArray, PHONE_TOPIC, self._on_phone, best_effort_qos)
         self.create_subscription(Float32MultiArray, TASK_TOPIC, self._on_task, best_effort_qos)
-        self.create_subscription(JointState, JOINT_STATES_TOPIC, self._on_joint_states, best_effort_qos)
+        # Joint states are not used in the Loon-E system anymore
+        #self.create_subscription(JointState, JOINT_STATES_TOPIC, self._on_joint_states, best_effort_qos)
+
+
         self.create_subscription(Odometry, ZED_ODOM_TOPIC, self._on_zed_odom, best_effort_qos)
         self.create_subscription(CompressedImage, ZED_IMAGE_TOPIC, self._on_zed_image, video_qos)
         self.create_subscription(RosoutLog, ROSOUT_TOPIC, self._on_rosout, reliable_qos)
@@ -772,25 +776,35 @@ class _BaseStationNode(Node):
         with self._lock:
             self._state["battery"]["primary"] = pct
 
-    # ------------------------------------------------------------------
-    # /asv/joint_states: prop_l_joint/prop_r_joint/rudder_joint fractions
-    # ------------------------------------------------------------------
-    def _on_joint_states(self, msg):
-        """
-        Callback for handling incoming actuator JointState echoes from busio_node.
-        """
+
+    def _on_motor_state(self,msg):
+        """Callback for the motor topic"""
         with self._lock:
             s = self._state
-            for name, position in zip(msg.name, msg.position):
-                fraction = float(position)
-                if name == "prop_l_joint":
-                    s["motors"]["left"] = fraction * 100.0
-                elif name == "prop_r_joint":
-                    s["motors"]["right"] = fraction * 100.0
-                elif name == "rudder_joint":
-                    s["rudder"]["angle"] = _rudder_fraction_to_deg(fraction)
-        log.debug("[JointStates] %s", dict(zip(msg.name, msg.position)))
-        self._last_joint_states = time.monotonic()
+            s["motors"]["left"] = msg[0] * 100.0
+            s["motors"]["right"] = msg[1] * 100.0
+            s["rudder"]["angle"] = _rudder_fraction_to_deg(msg[2])
+            log.debug("[MotorState] left=%.1f%% right=%.1f%% rudder=%.1f°", s["motors"]["left"], s["motors"]["right"], s["rudder"]["angle"])
+        self._last_motor_state = time.monotonic()
+    # ------------------------------------------------------------------
+    # /asv/joint_states: prop_l_joint/prop_r_joint/rudder_joint fractions
+    # # ------------------------------------------------------------------
+    # def _on_joint_states(self, msg):
+    #     """
+    #     Callback for handling incoming actuator JointState echoes from busio_node.
+    #     """
+    #     with self._lock:
+    #         s = self._state
+    #         for name, position in zip(msg.name, msg.position):
+    #             fraction = float(position)
+    #             if name == "prop_l_joint":
+    #                 s["motors"]["left"] = fraction * 100.0
+    #             elif name == "prop_r_joint":
+    #                 s["motors"]["right"] = fraction * 100.0
+    #             elif name == "rudder_joint":
+    #                 s["rudder"]["angle"] = _rudder_fraction_to_deg(fraction)
+    #     log.debug("[JointStates] %s", dict(zip(msg.name, msg.position)))
+    #     self._last_joint_states = time.monotonic()
 
     # ------------------------------------------------------------------
     # Phone: [latitude, longitude, speed, heading]

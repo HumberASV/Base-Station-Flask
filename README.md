@@ -177,6 +177,11 @@ Environment variables:
 | `FLASK_DEBUG=1` | Enables Flask's interactive debugger + reloader and `DEBUG`-level logging. **Never use in production** — it allows arbitrary code execution. |
 | `SECRET_KEY` | Flask session secret (defaults to a placeholder — set a real value for anything beyond local dev) |
 | `FACTORY_MODE=1` | Fallback for `--factory` if the flag isn't passed |
+| `MAP_FRAME` / `BASE_FRAME` | TF frames the vessel pose is looked up between (default `map` / `base_link`) |
+| `DRAW_DETECTIONS=0` | Disables the object-detection overlay. The bridge then forwards ZED frames byte for byte instead of decoding and re-encoding them (~10-30 ms/frame), so this is also the way to measure the overlay's latency cost. |
+| `DETECTION_MIN_CONFIDENCE` | Extra confidence floor for drawn boxes, on top of the ZED's own per-class thresholds (default `0.0`, i.e. draw everything that arrives) |
+| `DETECTION_SOURCE_WIDTH` / `DETECTION_SOURCE_HEIGHT` | The resolution the ZED's 2D detection boxes are expressed in. Both must be set together. See [Detection boxes in the wrong place](#detection-boxes-in-the-wrong-place). |
+| `ZED_NODE_NAME` | Fully-qualified ZED wrapper node used for the publish-resolution query (default `/zedx/zed_node`) — change it if `camera_name`/`zed_node_name` were overridden at launch |
 
 If ROS2 isn't reachable (not sourced, `rclpy` unimportable, or no ASV on the network), the app
 does **not** crash — it logs `rclpy not found — ROS2 bridge disabled` and serves idle/default
@@ -323,3 +328,37 @@ client still functions. Fix the ROS2 environment per the sections above and rest
 Also graceful degradation, not a crash — ZED image/object-detection subscriptions are just
 disabled. See [Optional: building ZED support](#optional-building-zed-support-cv_bridge--zed_msgs)
 above.
+
+### Detection boxes in the wrong place
+
+Boxes drawn offset from the buoys, sized wrong, or squashed against the right/bottom edge of
+the frame.
+
+`zed_msgs/BoundingBox2Di.corners` come from the ZED SDK's `sl::ObjectData::bounding_box_2d`,
+which is **pixels on the camera's grab resolution** — not on the image the wrapper publishes
+and that this bridge draws onto. When `general.pub_resolution` is `CUSTOM`, the published
+image is `grab / general.pub_downscale_factor`, and unscaled corners overshoot it.
+
+The bridge queries the ZED node for those two parameters at startup and scales accordingly,
+so this should be handled automatically. When it isn't — the node was not up in time, or
+`rclpy.parameter_client` is unavailable — the first-detection log line has everything needed
+to diagnose it:
+
+```text
+[ZED/objects] first detection: 2 object(s) ['red', 'green'], first box [(1204, 388), ...] (frame 960x540, box space assumed same as frame)
+```
+
+Corner values larger than the frame with `box space assumed same as frame` is the mismatch.
+Confirm against the camera and pin it manually:
+
+```powershell
+ros2 param get /zedx/zed_node general.grab_resolution      # e.g. HD1200 -> 1920x1200
+ros2 param get /zedx/zed_node general.pub_resolution
+ros2 param get /zedx/zed_node general.pub_downscale_factor
+
+$env:DETECTION_SOURCE_WIDTH = "1920"; $env:DETECTION_SOURCE_HEIGHT = "1200"
+```
+
+Note this affects only the overlay burned into the video. `zed.objects[].position` in the
+telemetry payload is a 3D centroid in metres and is unaffected, so the map and radar markers
+stay correct either way.

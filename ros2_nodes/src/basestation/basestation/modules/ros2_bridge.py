@@ -5,7 +5,7 @@ Topics consumed
 ---------------
 phone              (std_msgs/Float32MultiArray)  [latitude, longitude, speed, heading]
 task               (std_msgs/Float32MultiArray)  [action, target_heading, target_speed]
-/asv/joint_states  (sensor_msgs/JointState)  prop_l_joint/prop_r_joint/rudder_joint fractions
+/motor_state       (std_msgs/Float32MultiArray)  [left, right, rudder]
 battery_status/*   (sensor_msgs/BatteryState)  prop_l, prop_r, main
 zed                ()[odom, obj_det/objects, rgb/color/rect/image]
 /map               (nav_msgs/OccupancyGrid)  SLAM Toolbox global map -> map.occupancyGrid
@@ -82,6 +82,18 @@ except ImportError:
         def create_subscription(self, *a, **kw): pass
         def create_timer(self, *a, **kw): pass
         def destroy_node(self): pass
+
+## AsyncParameterClient lets the bridge ask the ZED node what resolution its detection
+## boxes are in (see _request_detection_source). Guarded separately from rclpy because it
+## arrived in Humble and is a nice-to-have: without it the overlay falls back to the
+## DETECTION_SOURCE_WIDTH/HEIGHT env vars, which is one manual step, not a broken bridge.
+try:
+    from rclpy.parameter_client import AsyncParameterClient
+    _PARAM_CLIENT_AVAILABLE = True
+except ImportError:
+    _PARAM_CLIENT_AVAILABLE = False
+    log.warning("rclpy.parameter_client not found — detection box scaling must be set "
+                "with DETECTION_SOURCE_WIDTH/HEIGHT.")
 
 try:
     from zed_msgs.msg import ObjectsStamped
@@ -171,16 +183,22 @@ def get_latest_frame_with_id() -> tuple:
 PHONE_TOPIC = "phone"
 TASK_TOPIC = "task"
 JOINT_STATES_TOPIC = "/asv/joint_states"
-ZED_ODOM_TOPIC = "zedx/zed_node/odom"
+ZED_ODOM_TOPIC = "odom"
 ZED_IMAGE_TOPIC = "/zedx/zed_node/rgb/color/rect/image/compressed"
 ZED_OBJECTS_TOPIC = "zedx/zed_node/obj_det/objects"
+# Fully-qualified name of the ZED wrapper node, used only to ask it what resolution its
+# 2D detection boxes are expressed in — see _request_detection_source(). Derived from the
+# same zedx/zed_node prefix as the two topics above; env-overridable for the same reason
+# MAP_FRAME/BASE_FRAME are, namely that camera_name/zed_node_name are launch arguments
+# (slam_launch.py defaults them to zedx/zed_node) and a renamed camera would move it.
+ZED_NODE_NAME = os.getenv("ZED_NODE_NAME", "/zedx/zed_node")
 ROSOUT_TOPIC = "/rosout"
 BATTERY_TOPIC = ""
 # SLAM Toolbox's global map, and the raw lidar it is built from. The ASV moved off
 # nav2/ros2_control onto SLAM Toolbox, which publishes /map as an OccupancyGrid.
 MAP_TOPIC = "/map"
 SCAN_TOPIC = "/scan"
-
+MOTOR_STATE_TOPIC = "motor"
 # TF frames the vessel pose is looked up between. Loon-E's chain is
 # `map -> odom -> zedx_camera_link -> base_link`: SLAM Toolbox tracks the ZED frame
 # (mapper_params_online_async.yaml sets base_frame: zedx_camera_link, because the ZED X
@@ -432,6 +450,14 @@ _MAP_STALE_THRESHOLD_S = 60.0
 # and a frozen boat sitting on live obstacle data is exactly the misrepresentation the
 # map-frame pose exists to remove.
 _POSE_STALE_THRESHOLD_S = 3.0
+# Detections, like the pose and unlike /map, must not be allowed to linger. The ZED
+# publishes an empty objects array whenever it sees nothing, so in normal operation the
+# overlay clears itself and this only fires when the topic dies outright — at which point
+# the last boxes would otherwise stay burned into every frame indefinitely, drawn as
+# though still live, and pin the camera path to a decode plus re-encode it no longer
+# needs. 2 s is far longer than the detector's publish period (object detection runs at
+# grab rate) so it cannot flicker mid-stream.
+_OBJECTS_STALE_THRESHOLD_S = 2.0
 # Seconds between repeats of the "no TF yet" warning. A missing map->base_link is the
 # normal state before SLAM converges, so this must not spam the log at spin rate.
 _TF_WARN_INTERVAL_S = 30.0
@@ -441,6 +467,13 @@ _TF_WARN_INTERVAL_S = 30.0
 # timer the cost is fixed and predictable instead. Must stay well under the tightest
 # threshold above (_POSE_STALE_THRESHOLD_S, 3 s) so staleness is still caught promptly.
 _TICK_PERIOD_S = 0.5
+
+# How long to keep asking the ZED node what resolution its detection boxes are in before
+# giving up and drawing them unscaled. Generous because the basestation routinely starts
+# before the ASV does, and the node has to be up for its parameter services to exist —
+# the retry is what covers that gap, and the timeout only exists so a camera that never
+# appears produces one actionable warning instead of a query every 0.5 s forever.
+_DETECTION_PARAM_TIMEOUT_S = 60.0
 
 # Maximum number of log entries to keep in the rolling log for each topic.
 _LOG_MAX = 50
@@ -541,6 +574,182 @@ def _jpeg_dimensions(data: bytes):
     return None
 
 
+# ---------------------------------------------------------------------------
+# Detection overlay
+# ---------------------------------------------------------------------------
+# Burning the boxes into the JPEG costs a decode plus a re-encode (~10-30 ms) on the
+# executor thread, and _on_zed_image's passthrough path exists precisely to avoid that
+# when there is nothing to draw. Being able to force passthrough without a code edit is
+# what makes the overlay's real latency cost measurable. Same os.getenv pattern as
+# MAP_MAX_AXIS / MAP_FRAME / BASE_FRAME.
+DRAW_DETECTIONS = os.getenv("DRAW_DETECTIONS", "1") != "0"
+
+# Extra confidence floor on top of the ZED's own per-class thresholds — Loon-E's
+# model.yaml already sets confidence_threshold 50.0 for all seven classes, so the 0.0
+# default draws everything that arrives and changes nothing. A tuning knob, not a filter
+# anything downstream depends on.
+DETECTION_MIN_CONFIDENCE = float(os.getenv("DETECTION_MIN_CONFIDENCE", "0.0"))
+
+
+# ---------------------------------------------------------------------------
+# Detection box coordinate space
+# ---------------------------------------------------------------------------
+# BoundingBox2Di.corners are filled by the ZED wrapper straight from the SDK's
+# `sl::ObjectData::bounding_box_2d`, documented as pixels on the ORIGINAL (grab) image —
+# NOT on the image the wrapper publishes and that this bridge draws onto. Loon-E grabs at
+# HD1080 and publishes at 384x216, a 5x downscale, so unscaled corners overshoot the frame
+# by 5x and _draw_ros_objects' clamp squashes every box against the right/bottom edge.
+# That is the "boxes are in the wrong place" failure.
+#
+# The fix needs one number: the resolution the corners are in. Everything below exists to
+# find it, in descending order of trustworthiness — explicit config, then the camera's own
+# answer, then a sane default.
+
+# sl::RESOLUTION -> pixels. Covers every value general.grab_resolution can take across the
+# ZED family; the ZED X supports HD1200/HD1080/SVGA, older models the rest. Doubles as the
+# lookup for the friendly DETECTION_SOURCE names.
+_ZED_RESOLUTIONS = {
+    "HD2K": (2208, 1242),
+    "HD1200": (1920, 1200),
+    "HD1080": (1920, 1080),
+    "HD1536": (1920, 1536),
+    "HD720": (1280, 720),
+    "SVGA": (960, 600),
+    "VGA": (672, 376),
+}
+
+# Used when nothing better is known — the ZED node never answered and no override is set.
+# HD1080 is what Loon-E's camera actually grabs at. Applied only to a frame that is both
+# smaller and the same shape (see _default_detection_source), so it cannot silently
+# mis-scale a NATIVE feed or a 16:10 HD1200 one.
+_DEFAULT_DETECTION_SOURCE = (1920, 1080)
+_ASPECT_TOLERANCE = 0.02
+
+
+def _parse_detection_source(raw: str) -> "tuple | None":
+    """Parse a DETECTION_SOURCE value: either `HD1080` or an explicit `1920x1080`."""
+    key = raw.strip().upper()
+    if key in _ZED_RESOLUTIONS:
+        return _ZED_RESOLUTIONS[key]
+    for sep in ("X", "*", ","):
+        if sep in key:
+            parts = key.split(sep)
+            if len(parts) == 2:
+                try:
+                    width, height = int(parts[0]), int(parts[1])
+                except ValueError:
+                    break
+                if width > 0 and height > 0:
+                    return (width, height)
+            break
+    log.warning("DETECTION_SOURCE=%r is not a resolution name (%s) or a WxH pair "
+                "— ignoring", raw, "/".join(sorted(_ZED_RESOLUTIONS)))
+    return None
+
+
+def _detection_source_override() -> "tuple | None":
+    """
+    Returns the configured `(width, height)` the detection corners are in, or None.
+
+    `DETECTION_SOURCE=HD1080` (or `DETECTION_SOURCE=1920x1080`) is the one to reach for.
+    `DETECTION_SOURCE_WIDTH`/`DETECTION_SOURCE_HEIGHT` do the same thing as a pair and are
+    kept because splitting the two is easier to drive from a launch file; both must be set
+    together, since one alone is ambiguous rather than a half-guess worth honouring.
+
+    Setting this pins the coordinate space outright: no parameter query, and correct even
+    when something other than the ZED wrapper is what resized the frames.
+    """
+    raw = os.getenv("DETECTION_SOURCE")
+    if raw:
+        return _parse_detection_source(raw)
+
+    raw_w = os.getenv("DETECTION_SOURCE_WIDTH")
+    raw_h = os.getenv("DETECTION_SOURCE_HEIGHT")
+    if not (raw_w and raw_h):
+        if raw_w or raw_h:
+            log.warning("DETECTION_SOURCE_WIDTH/HEIGHT must be set together — ignoring")
+        return None
+    try:
+        width, height = int(raw_w), int(raw_h)
+    except ValueError:
+        log.warning("DETECTION_SOURCE_WIDTH/HEIGHT are not integers (%r, %r) — ignoring",
+                    raw_w, raw_h)
+        return None
+    if width <= 0 or height <= 0:
+        log.warning("DETECTION_SOURCE_WIDTH/HEIGHT must be positive (%d, %d) — ignoring",
+                    width, height)
+        return None
+    return (width, height)
+
+
+DETECTION_SOURCE_SIZE = _detection_source_override()
+
+
+def _default_detection_source(width: int, height: int) -> "tuple | None":
+    """
+    _DEFAULT_DETECTION_SOURCE, but only where it is safe to assume.
+
+    Two guards. The frame must be *smaller* than the default — a frame at or above it is
+    either already native or from a bigger sensor mode, and scaling up would invent an
+    error where there was none. And the aspect ratios must match: a downscale preserves
+    shape, so a 16:10 frame (HD1200) against this 16:9 default means the guess is wrong
+    and no scaling is safer than the wrong scaling.
+    """
+    if width <= 0 or height <= 0:
+        return None
+    src_w, src_h = _DEFAULT_DETECTION_SOURCE
+    if width >= src_w or height >= src_h:
+        return None
+    if abs((width / height) - (src_w / src_h)) > _ASPECT_TOLERANCE:
+        return None
+    return _DEFAULT_DETECTION_SOURCE
+
+# Box colour per detected label, in cv2's BGR order (the sources below are RGB hex).
+#
+# These mirror the web client's map markers so one buoy is one colour wherever it is
+# drawn: OBJECT_COLOR_KEYS in the visualizer's src/utils/robot.ts maps each label to a
+# palette key, and src/theme/telemetryTheme.ts holds the hexes. Keep in sync with both —
+# telemetry_factory's _OBJECT_LABELS carries the same warning for the same reason.
+#
+#   green -> navGreen #10b981          red   -> navRed  #ef4444
+#   north/east/south/west -> hazard #eab308
+#   otter -> beacon #a855f7
+#
+# The four cardinal marks deliberately share one colour: robot.ts assigns by IALA
+# meaning and they all mark a hazard. The drawn label is what tells them apart.
+_LABEL_BGR = {
+    "green": (129, 185, 16),
+    "red": (68, 68, 239),
+    "north": (8, 179, 234),
+    "east": (8, 179, 234),
+    "south": (8, 179, 234),
+    "west": (8, 179, 234),
+    "otter": (247, 85, 168),
+}
+# robot.ts' DEFAULT_OBJECT_COLOR_KEY is navRed, so an unrecognised label falls back to
+# the same colour here as it does on the map.
+_DEFAULT_LABEL_BGR = (68, 68, 239)
+
+# Boxes thinner than this on either axis are dropped. BoundingBox2Di.corners is a
+# FIXED-size Keypoint2Di[4], so rosidl always materialises four keypoints: an object the
+# ZED tracked in 3D but could not project into the image arrives as four (0, 0) corners
+# rather than as an empty list, and without this check it paints a dot and a floating
+# label in the frame's top-left on every frame. Also catches a box entirely off-frame,
+# which clamps down to a zero-area line.
+_MIN_BOX_PX = 2
+
+# One-shot latch for the "corners overshoot the frame and nothing is scaling them"
+# warning below. A plain bool is enough: the worst a race between executor threads can do
+# is log the line twice.
+_scale_warned = False
+
+log.info("detection overlay  draw=%s  min_confidence=%.1f  source=%s",
+         DRAW_DETECTIONS, DETECTION_MIN_CONFIDENCE,
+         f"{DETECTION_SOURCE_SIZE[0]}x{DETECTION_SOURCE_SIZE[1]} (configured)"
+         if DETECTION_SOURCE_SIZE else
+         f"auto (default {_DEFAULT_DETECTION_SOURCE[0]}x{_DEFAULT_DETECTION_SOURCE[1]})")
+
+
 def _to_bgr_cv2(frame: "np.ndarray", enc: str) -> "np.ndarray":
     if enc in ('bgra8', 'bgra'):
         return cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
@@ -551,30 +760,107 @@ def _to_bgr_cv2(frame: "np.ndarray", enc: str) -> "np.ndarray":
     return frame  # already bgr8
 
 
-def _draw_ros_objects(frame: "np.ndarray", objects: list) -> None:
+def _label_colors(label: str) -> tuple:
+    """
+    Returns `(box_bgr, text_bgr)` for a detection label.
+
+    The box colour comes from _LABEL_BGR; the text colour is black or white chosen by
+    the fill's luminance, so the label chip stays readable on both the light hazard
+    yellow and the dark nav red. The overlay used to hardcode black on green, which
+    left the text nearly invisible once the boxes stopped all being one colour.
+    """
+    bgr = _LABEL_BGR.get(label, _DEFAULT_LABEL_BGR)
+    b, g, r = bgr
+    # Rec. 601 luma — the usual cheap perceived-brightness approximation.
+    luma = 0.299 * r + 0.587 * g + 0.114 * b
+    return bgr, ((0, 0, 0) if luma > 140 else (255, 255, 255))
+
+
+def _draw_ros_objects(frame: "np.ndarray", objects: list, source_size: "tuple | None" = None) -> None:
     """
     Draw 2D bounding boxes from raw ZED ROS2 objects onto frame in-place.
+
+    Each box is coloured by label to match the web client's map markers (see
+    _LABEL_BGR) and carries a `<label> <confidence>%` chip. Degenerate and off-frame
+    boxes are dropped or clamped here rather than handed to OpenCV, which clips them
+    silently and would otherwise place the chip at coordinates outside the image.
+
     Args:
-        frame: The image frame to draw on.
+        frame: The image frame to draw on, modified in place.
         objects: A list of ZED ROS2 object messages.
+        source_size: `(width, height)` the corners are expressed in — the camera's grab
+            resolution, which is NOT necessarily this frame's size. See
+            _detection_source_override(). None means "unknown", which draws the corners
+            as-is (the historical behaviour) and warns once if they overshoot.
     """
-    if not (_CV2_OK and objects):
+    if not (_CV2_OK and objects and DRAW_DETECTIONS):
         return
+
+    global _scale_warned
+
+    height, width = frame.shape[:2]
+    # Corners live in the grab-resolution image; the frame here is whatever the wrapper
+    # published. Scale x and y independently — it costs nothing and stays correct if the
+    # two resolutions ever stop sharing an aspect ratio.
+    if source_size and source_size[0] > 0 and source_size[1] > 0:
+        sx = width / float(source_size[0])
+        sy = height / float(source_size[1])
+    else:
+        sx = sy = 1.0
+
     for obj in objects:
         try:
             corners = obj.bounding_box_2d.corners
-        except AttributeError:
+            confidence = float(obj.confidence)
+            label = str(obj.label)
+        except (AttributeError, TypeError, ValueError):
             continue
-        if not corners:
+        if len(corners) < 4 or confidence < DETECTION_MIN_CONFIDENCE:
             continue
-        pts = np.array([[int(c.kp[0]), int(c.kp[1])] for c in corners], dtype=np.int32)
-        cv2.polylines(frame, [pts], isClosed=True, color=(0, 255, 0), thickness=2)
-        label = f"{obj.label} {obj.confidence:.0f}%"
-        x0, y0 = pts[0]
-        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-        cv2.rectangle(frame, (x0, y0 - th - 6), (x0 + tw + 4, y0), (0, 255, 0), cv2.FILLED)
-        cv2.putText(frame, label, (x0 + 2, y0 - 3),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
+
+        pts = np.array([[int(round(c.kp[0] * sx)), int(round(c.kp[1] * sy))]
+                        for c in corners], dtype=np.int32)
+
+        # A corner outside the frame while nothing is scaling is the grab-vs-published
+        # resolution mismatch itself: the clamp below is about to squash this box against
+        # the right/bottom edge. Say so once rather than silently drawing it wrong.
+        if not _scale_warned and sx == 1.0 and sy == 1.0 and (
+                pts[:, 0].max() >= width or pts[:, 1].max() >= height):
+            _scale_warned = True
+            log.warning(
+                "[ZED/objects] box corner %s falls outside the %dx%d frame and no "
+                "detection source resolution is known — boxes will be drawn in the wrong "
+                "place. Set DETECTION_SOURCE to the camera's grab resolution "
+                "(ros2 param get %s general.grab_resolution).",
+                [(int(p[0]), int(p[1])) for p in pts], width, height, ZED_NODE_NAME)
+
+        # Clamp into the frame so a partly-visible detection still draws its visible
+        # edges, and so the chip below is positioned from real in-frame coordinates.
+        np.clip(pts[:, 0], 0, width - 1, out=pts[:, 0])
+        np.clip(pts[:, 1], 0, height - 1, out=pts[:, 1])
+        if (pts[:, 0].max() - pts[:, 0].min() < _MIN_BOX_PX
+                or pts[:, 1].max() - pts[:, 1].min() < _MIN_BOX_PX):
+            continue
+
+        box_bgr, text_bgr = _label_colors(label)
+        cv2.polylines(frame, [pts], isClosed=True, color=box_bgr, thickness=2)
+
+        text = f"{label} {confidence:.0f}%"
+        (tw, th), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        # baseline is the descender room below the text origin; without it the tails of
+        # 'g' and 'y' fall outside the chip.
+        chip_h = th + baseline + 4
+        # corners[0] is the box's top-left (see BoundingBox2Di.msg's diagram). Sit the
+        # chip above that edge when there is room and just inside the box when there is
+        # not — a detection touching the top of the frame previously had its entire chip
+        # drawn at negative y, i.e. clipped away.
+        x0, y0 = int(pts[0][0]), int(pts[0][1])
+        chip_top = y0 - chip_h if y0 - chip_h >= 0 else y0
+        chip_left = min(x0, max(0, width - (tw + 4)))
+        cv2.rectangle(frame, (chip_left, chip_top),
+                      (chip_left + tw + 4, chip_top + chip_h), box_bgr, cv2.FILLED)
+        cv2.putText(frame, text, (chip_left + 2, chip_top + th + 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_bgr, 1, cv2.LINE_AA)
 
 def is_ros2_available() -> bool:
     """
@@ -599,7 +885,7 @@ def get_available_topics(): #-> list[str]:
         A list of topic names that are available for subscription.
     """
     topics = [
-        PHONE_TOPIC, TASK_TOPIC, JOINT_STATES_TOPIC, ZED_ODOM_TOPIC, ZED_IMAGE_TOPIC,
+        PHONE_TOPIC, TASK_TOPIC, MOTOR_STATE_TOPIC, ZED_ODOM_TOPIC, ZED_IMAGE_TOPIC,
         MAP_TOPIC, SCAN_TOPIC,
         "battery_status/prop_l", "battery_status/prop_r", "battery_status/main",
     ]
@@ -661,6 +947,24 @@ class _BaseStationNode(Node):
         # Raw ROS2 ZED objects kept for annotation overlay (not serialized into state)
         self._raw_objects: list = []
         self._raw_objects_lock = threading.Lock()
+        self._objects_seen = False
+
+        # The coordinate space the detection corners live in, as answered by the ZED node.
+        # _detection_grab_size is the absolute resolution and is preferred;
+        # _detection_downscale is the fallback ratio for when grab_resolution came back as
+        # AUTO. Both stay unset until _poll_detection_source() gets a reply, and
+        # _detection_source_size() falls back to the aspect-guarded default meanwhile.
+        self._detection_grab_size = None
+        self._detection_downscale = 1.0
+        # Nothing to resolve when the operator has already said so, when there are no
+        # detections to draw, or when this rclpy is too old to ask.
+        self._detection_source_resolved = (
+            DETECTION_SOURCE_SIZE is not None
+            or not (_ZED_MSGS_AVAILABLE and _PARAM_CLIENT_AVAILABLE and DRAW_DETECTIONS)
+        )
+        self._zed_param_client = None
+        self._zed_param_future = None
+        self._zed_param_deadline = time.monotonic() + _DETECTION_PARAM_TIMEOUT_S
 
         reliable_qos = QoSProfile(depth=10)
         best_effort_qos = QoSProfile(
@@ -700,7 +1004,7 @@ class _BaseStationNode(Node):
         self.create_subscription(Float32MultiArray, TASK_TOPIC, self._on_task, best_effort_qos)
         # Joint states are not used in the Loon-E system anymore
         #self.create_subscription(JointState, JOINT_STATES_TOPIC, self._on_joint_states, best_effort_qos)
-
+        self.create_subscription(Float32MultiArray, MOTOR_STATE_TOPIC, self._on_motor_state, best_effort_qos)
 
         self.create_subscription(Odometry, ZED_ODOM_TOPIC, self._on_zed_odom, best_effort_qos)
         self.create_subscription(CompressedImage, ZED_IMAGE_TOPIC, self._on_zed_image, video_qos)
@@ -737,7 +1041,7 @@ class _BaseStationNode(Node):
         self._map_worker.start()
 
         self.get_logger().info(
-            f"Subscribed to '{PHONE_TOPIC}', '{TASK_TOPIC}', '{JOINT_STATES_TOPIC}', "
+            f"Subscribed to '{PHONE_TOPIC}', '{TASK_TOPIC}', '{MOTOR_STATE_TOPIC}', "
             f"'{ZED_ODOM_TOPIC}', '{ZED_IMAGE_TOPIC}', '{MAP_TOPIC}', '{SCAN_TOPIC}', "
             f"battery_status/{{prop_l,prop_r,main}}"
             + (f", '{ZED_OBJECTS_TOPIC}'" if _ZED_MSGS_AVAILABLE else " (ZED objects skipped — zed_msgs unavailable)")
@@ -784,7 +1088,12 @@ class _BaseStationNode(Node):
             s["motors"]["left"] = msg[0] * 100.0
             s["motors"]["right"] = msg[1] * 100.0
             s["rudder"]["angle"] = _rudder_fraction_to_deg(msg[2])
-            log.debug("[MotorState] left=%.1f%% right=%.1f%% rudder=%.1f°", s["motors"]["left"], s["motors"]["right"], s["rudder"]["angle"])
+            self.get_logger().info(
+                f"Received motor state: left={s['motors']['left']:.1f}%, "
+                f"right={s['motors']['right']:.1f}%, "
+                f"rudder={s['rudder']['angle']:.1f}°"
+            )
+        log.debug("[MotorState] left=%.1f%% right=%.1f%% rudder=%.1f°", s["motors"]["left"], s["motors"]["right"], s["rudder"]["angle"])
         self._last_motor_state = time.monotonic()
     # ------------------------------------------------------------------
     # /asv/joint_states: prop_l_joint/prop_r_joint/rudder_joint fractions
@@ -879,6 +1188,106 @@ class _BaseStationNode(Node):
         self._last_zed_odom = time.monotonic()
 
     # ------------------------------------------------------------------
+    # Detection box coordinate space — see _detection_source_override()
+    # ------------------------------------------------------------------
+    def _detection_source_size(self, width: int, height: int) -> "tuple | None":
+        """
+        Returns the `(width, height)` the detection corners are expressed in, for a frame
+        of `width` x `height`, or None to draw them unscaled.
+
+        Precedence: explicit config, then whatever the ZED node reported, then the
+        aspect-guarded default. `width`/`height` matter only to the last two — an absolute
+        grab resolution is preferred over a per-frame derivation because it stays right
+        when something downstream of the wrapper is what resized the image.
+        """
+        if DETECTION_SOURCE_SIZE is not None:
+            return DETECTION_SOURCE_SIZE
+        if self._detection_grab_size is not None:
+            return self._detection_grab_size
+        if self._detection_downscale > 1.0:
+            # grab_resolution was AUTO or unmapped, but the publish factor pins the ratio:
+            # the wrapper computes `published = grab / pub_downscale_factor`.
+            return (width * self._detection_downscale, height * self._detection_downscale)
+        return _default_detection_source(width, height)
+
+    def _request_detection_source(self) -> None:
+        """
+        Ask the ZED node how much it downscales its published images.
+
+        Fire-and-forget: the reply is collected by _poll_detection_source() from the tick
+        timer. Called both at startup and on retry, so it must be safe to call repeatedly.
+        """
+        if self._zed_param_client is None:
+            self._zed_param_client = AsyncParameterClient(self, ZED_NODE_NAME)
+        if not self._zed_param_client.services_are_ready():
+            return  # ZED node not up yet — tick() will try again
+        self._zed_param_future = self._zed_param_client.get_parameters([
+            "general.pub_resolution",
+            "general.pub_downscale_factor",
+            "general.grab_resolution",
+        ])
+
+    def _poll_detection_source(self, now: float) -> None:
+        """
+        Collect the ZED parameter reply, or give up and tell the operator what to set.
+
+        Runs on the tick timer rather than a callback so it shares the existing spin loop:
+        AsyncParameterClient's future is resolved by the same executor that services every
+        other subscription here, and polling it costs a `done()` check per tick.
+        """
+        if self._detection_source_resolved:
+            return
+        if now > self._zed_param_deadline:
+            self._detection_source_resolved = True
+            log.warning(
+                "[ZED/objects] %s did not answer a parameter query within %.0fs — "
+                "falling back to assuming a %dx%d grab resolution for detection boxes. "
+                "If they land in the wrong place, set DETECTION_SOURCE to the camera's "
+                "actual grab resolution (e.g. DETECTION_SOURCE=HD1200).",
+                ZED_NODE_NAME, _DETECTION_PARAM_TIMEOUT_S, *_DEFAULT_DETECTION_SOURCE)
+            return
+
+        if self._zed_param_future is None:
+            self._request_detection_source()
+            return
+        if not self._zed_param_future.done():
+            return
+
+        try:
+            values = self._zed_param_future.result().values
+            pub_resolution = values[0].string_value
+            downscale = float(values[1].double_value)
+            grab_resolution = values[2].string_value
+        except Exception:
+            log.exception("[ZED/objects] failed to read %s parameters", ZED_NODE_NAME)
+            self._detection_source_resolved = True
+            return
+
+        # grab_resolution is the direct answer and the one to prefer: it is the space the
+        # corners are in regardless of who downscaled the frame afterwards. It can come
+        # back as AUTO (the SDK picks per camera model) or as a name this table predates,
+        # in which case fall back to the publish factor.
+        self._detection_grab_size = _ZED_RESOLUTIONS.get(grab_resolution.strip().upper())
+
+        # CUSTOM is the only mode that downscales; NATIVE publishes at the grab
+        # resolution, which is already what the corners are in. A zero/absent factor means
+        # the parameter was not set (an unset param comes back as an empty value, i.e.
+        # 0.0), so treat anything below 1 as "no downscale" rather than dividing by it.
+        if pub_resolution.strip().upper() == "CUSTOM" and downscale > 1.0:
+            self._detection_downscale = downscale
+        else:
+            self._detection_downscale = 1.0
+
+        self._detection_source_resolved = True
+        log.info("[ZED/objects] %s grab_resolution=%s pub_resolution=%s "
+                 "pub_downscale_factor=%.3f — detection boxes read as %s",
+                 ZED_NODE_NAME, grab_resolution or "?", pub_resolution or "?", downscale,
+                 f"{self._detection_grab_size[0]}x{self._detection_grab_size[1]}"
+                 if self._detection_grab_size
+                 else (f"frame x{self._detection_downscale:.3f}"
+                       if self._detection_downscale > 1.0 else "frame-sized"))
+
+    # ------------------------------------------------------------------
     # ZED: RGB image  (sensor_msgs/Image) — stores metadata + produces JPEG
     # ------------------------------------------------------------------
     def _on_zed_image(self, msg):
@@ -934,7 +1343,7 @@ class _BaseStationNode(Node):
             cam["height"] = int(height)
             cam["encoding"] = msg.format
 
-        _draw_ros_objects(frame, objects)
+        _draw_ros_objects(frame, objects, self._detection_source_size(width, height))
 
         ok, buf = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
         if ok:
@@ -952,7 +1361,8 @@ class _BaseStationNode(Node):
                 frame = self._bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
                 frame = _to_bgr_cv2(frame, enc)
                 with self._raw_objects_lock:
-                    _draw_ros_objects(frame, list(self._raw_objects))
+                    _draw_ros_objects(frame, list(self._raw_objects),
+                                      self._detection_source_size(msg.width, msg.height))
                 ok, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
                 if ok:
                     return buf.tobytes()
@@ -1027,6 +1437,34 @@ class _BaseStationNode(Node):
         with self._raw_objects_lock:
             self._raw_objects = list(msg.objects)
         self._last_zed_objects = time.monotonic()
+
+        # The first real detection is the one log line that separates "the detector is
+        # running" from "the topic exists but never fires" — object_detection.od_enabled
+        # defaults to false in the ZED wrapper, and a silent topic is otherwise
+        # indistinguishable from a working one that has simply seen nothing yet.
+        #
+        # The corner pixels, the frame size and the resolved box space all go in
+        # deliberately: a box in grab-resolution coordinates drawn onto a downscaled
+        # published image is the failure that looks like "the boxes are in the wrong
+        # place", and this one line carries everything needed to confirm or rule it out.
+        # Fires again after a staleness gap, on purpose.
+        if objects and not self._objects_seen:
+            self._objects_seen = True
+            try:
+                box = [(int(c.kp[0]), int(c.kp[1]))
+                       for c in msg.objects[0].bounding_box_2d.corners]
+            except (AttributeError, IndexError, TypeError):
+                box = []
+            with self._lock:
+                cam = self._state["zed"]["camera"]
+                frame_w, frame_h = int(cam["width"]), int(cam["height"])
+                _append_log(self._state["task"]["log"],
+                            f"Object detection online ({len(objects)} detected).")
+            source = self._detection_source_size(frame_w, frame_h)
+            log.info("[ZED/objects] first detection: %d object(s) %s, first box %s "
+                     "(frame %dx%d, box space %s)",
+                     len(objects), [o["label"] for o in objects], box, frame_w, frame_h,
+                     f"{source[0]:.0f}x{source[1]:.0f}" if source else "assumed same as frame")
 
     # ------------------------------------------------------------------
     # /map  (nav_msgs/OccupancyGrid) — SLAM Toolbox's global map
@@ -1237,11 +1675,14 @@ class _BaseStationNode(Node):
     # ------------------------------------------------------------------
     def tick(self):
         """
-        Poll TF for the vessel pose, then check the staleness of every data source.
+        Poll TF for the vessel pose and the ZED's publish resolution, then check the
+        staleness of every data source.
         """
         self._poll_vessel_pose()
 
         now = time.monotonic()
+        self._poll_detection_source(now)
+
         with self._lock:
             log_list = self._state["task"]["log"]
 
@@ -1257,6 +1698,18 @@ class _BaseStationNode(Node):
             if self._last_zed_odom > 0 and (now - self._last_zed_odom) > _STALE_THRESHOLD_S:
                 _append_log(log_list, "WARNING: ZED odometry lost.")
                 self._last_zed_odom = now
+
+            # Detections are cleared rather than preserved, for the same reason the pose
+            # below is nulled: boxes left burned onto the video read as current.
+            objects_stale = (
+                self._last_zed_objects > 0
+                and (now - self._last_zed_objects) > _OBJECTS_STALE_THRESHOLD_S
+            )
+            if objects_stale:
+                self._state["zed"]["objects"] = []
+                self._objects_seen = False
+                _append_log(log_list, "WARNING: ZED object detections lost.")
+                self._last_zed_objects = now
 
             # /map legitimately goes quiet when SLAM Toolbox has nothing new to
             # publish, so a long gap is not itself a fault — use a much longer
@@ -1285,6 +1738,16 @@ class _BaseStationNode(Node):
                 # Deliberately leave _latest_frame alone -- keep showing the last frame
                 # actually received rather than replacing it with a placeholder. sad.jpg
                 # is only ever the *initial* value, before any real frame has arrived.
+
+        # Outside the `self._lock` block deliberately. _on_zed_image acquires
+        # _raw_objects_lock and releases it BEFORE taking self._lock, so taking the two
+        # in the opposite order here would be a lock-order inversion between the executor
+        # thread and this timer. Dropping the boxes also returns _on_zed_image to its
+        # passthrough path, so a dead detector stops costing a decode + re-encode per
+        # frame as well as no longer drawing stale data.
+        if objects_stale:
+            with self._raw_objects_lock:
+                self._raw_objects = []
 
 
 # ----------------------------------------------------------------------

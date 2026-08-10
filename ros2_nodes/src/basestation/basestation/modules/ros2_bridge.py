@@ -173,7 +173,7 @@ TASK_TOPIC = "task"
 JOINT_STATES_TOPIC = "/asv/joint_states"
 ZED_ODOM_TOPIC = "zedx/zed_node/odom"
 ZED_IMAGE_TOPIC = "/zedx/zed_node/rgb/color/rect/image/compressed"
-ZED_OBJECTS_TOPIC = "zedx/obj_det/objects"
+ZED_OBJECTS_TOPIC = "zedx/zed_node/obj_det/objects"
 ROSOUT_TOPIC = "/rosout"
 BATTERY_TOPIC = ""
 # SLAM Toolbox's global map, and the raw lidar it is built from. The ASV moved off

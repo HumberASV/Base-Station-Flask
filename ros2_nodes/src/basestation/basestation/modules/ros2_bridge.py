@@ -5,7 +5,11 @@ Topics consumed
 ---------------
 phone              (std_msgs/Float32MultiArray)  [latitude, longitude, speed, heading]
 task               (std_msgs/Float32MultiArray)  [action, target_heading, target_speed]
-/motor_state       (std_msgs/Float32MultiArray)  [left, right, rudder]
+motor              (std_msgs/Float32MultiArray)  [left, right, rudder] servo fractions;
+                   the two propellers are republished as a SIGNED percentage
+                   (-100 astern / 0 stopped / +100 ahead) — see _on_motor_state
+led                (std_msgs/ColorRGBA)  the mast status light, 0..1 channels ->
+                   status.led; alpha is republished as a has-a-reading flag
 battery_status/*   (sensor_msgs/BatteryState)  prop_l, prop_r, main
 zed                ()[odom, obj_det/objects, rgb/color/rect/image]
 /map               (nav_msgs/OccupancyGrid)  SLAM Toolbox global map -> map.occupancyGrid
@@ -64,7 +68,7 @@ try:
     from rclpy.node import Node
     from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSDurabilityPolicy
     from rcl_interfaces.msg import Log as RosoutLog
-    from std_msgs.msg import Float32MultiArray
+    from std_msgs.msg import Float32MultiArray, ColorRGBA
     from nav_msgs.msg import Odometry, OccupancyGrid
     from sensor_msgs.msg import CompressedImage, BatteryState, JointState, LaserScan
     log.debug("rclpy and ROS2 message types are available — ROS2 bridge enabled.")
@@ -199,6 +203,9 @@ BATTERY_TOPIC = ""
 MAP_TOPIC = "/map"
 SCAN_TOPIC = "/scan"
 MOTOR_STATE_TOPIC = "motor"
+# The mast status light. Published by Loon-E's motor_node, which owns the two GPIO
+# lines (autonomy / e-stop) the lamp is driven from — see its set_led().
+LED_TOPIC = "led"
 # TF frames the vessel pose is looked up between. Loon-E's chain is
 # `map -> odom -> zedx_camera_link -> base_link`: SLAM Toolbox tracks the ZED frame
 # (mapper_params_online_async.yaml sets base_frame: zedx_camera_link, because the ZED X
@@ -478,12 +485,47 @@ _DETECTION_PARAM_TIMEOUT_S = 60.0
 # Maximum number of log entries to keep in the rolling log for each topic.
 _LOG_MAX = 50
 
-# Maps the action float published by Task to a TaskStatus string
-_ACTION_TO_STATUS = {
-    0.0: "standby",
-    1.0: "autonomous",
-    2.0: "remote",
-}
+# A lamp channel at or below this is treated as off. The light is driven by a PWM
+# duty cycle rather than a clean digital level, so an "off" channel can arrive as a
+# small non-zero float; classifying strictly against 0.0 would read every amber as
+# some third colour. Kept in step with the web client's CHANNEL_ON_THRESHOLD
+# (visualizer/src/utils/led.ts).
+_LED_CHANNEL_ON_THRESHOLD = 0.25
+
+
+def _led_to_status(red: float, green: float) -> str:
+    """
+    Classify the mast lamp into the mode it is signalling.
+
+    The lamp is driven straight off two GPIO lines by Loon-E's motor.py set_led:
+    e-stop not clear wins and shows red alone; otherwise autonomy engaged shows
+    green alone; otherwise both channels light, which the eye reads as amber.
+
+    Amber therefore covers BOTH "remote control" and "standby" — the boat has only
+    the two lines and cannot separate them. "remote" is returned for amber because
+    it is the safer of the two to display: it says a human is in the loop. The web
+    client refines this using thruster power, which the bridge deliberately does not
+    do here so that a client can disagree without the bridge having already
+    committed. See selectIndicatorStatus in the visualizer.
+
+    Args:
+        red: Red channel, 0..1.
+        green: Green channel, 0..1.
+    Returns:
+        A TaskStatus string matching the web client's TaskValues.
+    """
+    red_on = red > _LED_CHANNEL_ON_THRESHOLD
+    green_on = green > _LED_CHANNEL_ON_THRESHOLD
+
+    if red_on and green_on:
+        return "remote"
+    if green_on:
+        return "autonomous"
+    if red_on:
+        return "out of control"
+    # Callers drop dark frames before reaching here, so this is only hit by a lamp
+    # reporting a colour with neither mast channel lit — a bench rig, not the boat.
+    return "standby"
 
 
 def _quat_to_rpy(x: float, y: float, z: float, w: float): #-> tuple[float, float, float]:
@@ -885,7 +927,7 @@ def get_available_topics(): #-> list[str]:
         A list of topic names that are available for subscription.
     """
     topics = [
-        PHONE_TOPIC, TASK_TOPIC, MOTOR_STATE_TOPIC, ZED_ODOM_TOPIC, ZED_IMAGE_TOPIC,
+        PHONE_TOPIC, TASK_TOPIC, MOTOR_STATE_TOPIC, LED_TOPIC, ZED_ODOM_TOPIC, ZED_IMAGE_TOPIC,
         MAP_TOPIC, SCAN_TOPIC,
         "battery_status/prop_l", "battery_status/prop_r", "battery_status/main",
     ]
@@ -928,6 +970,7 @@ class _BaseStationNode(Node):
         self._last_tf_warn = 0.0
         self._last_tf_stamp = None
         self._pose_seen = False
+        self._last_led_state = 0.0
         # Fingerprint of the last /map message accepted, so an unchanged republish is
         # dropped before any conversion work happens — see _map_key / _on_map.
         self._last_map_key = None
@@ -1014,6 +1057,8 @@ class _BaseStationNode(Node):
         self.create_subscription(BatteryState, "battery_status/prop_l", self._on_battery_prop_l, reliable_qos)
         self.create_subscription(BatteryState, "battery_status/prop_r", self._on_battery_prop_r, reliable_qos)
         self.create_subscription(BatteryState, "battery_status/main", self._on_battery_main, reliable_qos)
+        self.create_subscription(ColorRGBA, LED_TOPIC, self._on_led, reliable_qos)
+
         if _ZED_MSGS_AVAILABLE:
             self.create_subscription(
                 ObjectsStamped, ZED_OBJECTS_TOPIC, self._on_zed_objects, reliable_qos
@@ -1081,20 +1126,67 @@ class _BaseStationNode(Node):
             self._state["battery"]["primary"] = pct
 
 
-    def _on_motor_state(self,msg):
-        """Callback for the motor topic"""
+    def _on_motor_state(self, msg):
+        """Callback for the motor topic — [left, right, rudder] servo fractions."""
+        d = msg.data
+        if len(d) < 3:
+            return
+        # Propeller fractions are 0.0 reverse / 0.5 neutral / 1.0 forward (see motor.py).
+        # Recentre on 0.5 and scale to a signed percentage so the client can tell astern
+        # from ahead: -100 full reverse, 0 stopped, +100 full forward.
+        left = (float(d[0]) - 0.5) * 200.0
+        right = (float(d[1]) - 0.5) * 200.0
+        angle = _rudder_fraction_to_deg(float(d[2]))
         with self._lock:
             s = self._state
-            s["motors"]["left"] = msg[0] * 100.0
-            s["motors"]["right"] = msg[1] * 100.0
-            s["rudder"]["angle"] = _rudder_fraction_to_deg(msg[2])
-            self.get_logger().info(
-                f"Received motor state: left={s['motors']['left']:.1f}%, "
-                f"right={s['motors']['right']:.1f}%, "
-                f"rudder={s['rudder']['angle']:.1f}°"
-            )
-        log.debug("[MotorState] left=%.1f%% right=%.1f%% rudder=%.1f°", s["motors"]["left"], s["motors"]["right"], s["rudder"]["angle"])
+            s["motors"]["left"] = left
+            s["motors"]["right"] = right
+            s["rudder"]["angle"] = angle
+        log.debug("[MotorState] left=%.1f%% right=%.1f%% rudder=%.1f°", left, right, angle)
         self._last_motor_state = time.monotonic()
+
+
+    def _on_led(self, msg):
+        """Callback for the `led` topic — the vessel's physical status light.
+
+        ColorRGBA carries its channels as fields (r/g/b/a), not in a `.data`
+        sequence the way Float32MultiArray does, so there is nothing to index here.
+
+        Dark frames are dropped rather than stored. The mast lamp BLINKS — motor.py's
+        set_led alternates lit and dark on a timer, and its publish_led runs on a
+        separate timer of the same period, so roughly half the frames on this topic
+        are all-channels-off and carry no mode information. Storing them would make
+        every indicator downstream flicker between the real mode and "dark" at the
+        blink rate. Liveness is still recorded for every frame, lit or not, so the
+        staleness watchdog measures the topic rather than the duty cycle.
+
+        `alpha` is forced to 1.0 rather than copied from msg.a: the client reads it
+        as a has-a-reading flag (see make_default_state), and the publisher leaves
+        a at its 0.0 default, which would leave the dashboard on its standby
+        fallback no matter what colour arrived.
+        """
+        # Liveness first, and unconditionally — a blinking lamp is a healthy lamp.
+        self._last_led_state = time.monotonic()
+
+        red, green, blue = float(msg.r), float(msg.g), float(msg.b)
+        if max(red, green, blue) <= _LED_CHANNEL_ON_THRESHOLD:
+            log.debug("[LED] blink-off frame, holding r=%.2f g=%.2f b=%.2f",
+                      self._state["led"]["red"], self._state["led"]["green"],
+                      self._state["led"]["blue"])
+            return
+
+        status = _led_to_status(red, green)
+        with self._lock:
+            s = self._state
+            s["led"]["red"] = red
+            s["led"]["green"] = green
+            s["led"]["blue"] = blue
+            s["led"]["alpha"] = 1.0
+            # The lamp is the only live source of the vessel's mode — see the module
+            # docstring and _on_task for why the `task` action float is not one.
+            s["planning"]["status"] = status
+            s["task"]["data"]["status"] = status
+        log.debug("[LED] r=%.2f g=%.2f b=%.2f status=%s", red, green, blue, status)
     # ------------------------------------------------------------------
     # /asv/joint_states: prop_l_joint/prop_r_joint/rudder_joint fractions
     # # ------------------------------------------------------------------
@@ -1144,6 +1236,19 @@ class _BaseStationNode(Node):
     def _on_task(self, msg):
         """
         Callback for handling incoming task messages.
+
+        Logs only. This deliberately no longer writes planning.status /
+        task.data.status, for two reasons:
+
+        1. `action` is a MOTOR COMMAND, not a mode. Loon-E's task.py emits -1.0
+           reverse, 0.0 stop, 1.0 drive and 2.0 turn (see its publish_motor call
+           sites), so the old _ACTION_TO_STATUS reading of 2.0 as "remote control"
+           was a category error, and it had no value for "out of control" at all.
+        2. Nothing publishes the bare `task` topic any more — task.py publishes to
+           `motor_command`. The subscription is kept because the topic may come
+           back, and its log line is still useful when it does.
+
+        The vessel's mode now comes from the mast lamp instead. See _on_led.
         """
         d = msg.data
         if len(d) < 3:
@@ -1151,18 +1256,14 @@ class _BaseStationNode(Node):
         action = float(d[0])
         target_heading = float(d[1])
         target_speed = float(d[2])
-        status = _ACTION_TO_STATUS.get(action, "standby")
-        log.debug("[Task] action=%.0f status=%s heading=%.1f speed=%.3f", action, status, target_heading, target_speed)
+        log.debug("[Task] action=%.0f heading=%.1f speed=%.3f", action, target_heading, target_speed)
         entry = (
             f"Task — action={action:.0f} "
             f"heading={target_heading:.1f}° "
             f"speed={target_speed:.2f} m/s"
         )
         with self._lock:
-            s = self._state
-            s["planning"]["status"] = status
-            s["task"]["data"]["status"] = status
-            _append_log(s["task"]["log"], entry)
+            _append_log(self._state["task"]["log"], entry)
         self._last_task = time.monotonic()
 
     # ------------------------------------------------------------------
@@ -1694,6 +1795,18 @@ class _BaseStationNode(Node):
             if self._last_task > 0 and (now - self._last_task) > _STALE_THRESHOLD_S:
                 _append_log(log_list, "WARNING: Task data lost.")
                 self._last_task = now
+
+            # A lamp that has stopped reporting means the mode is unknown, so alpha is
+            # cleared back to the has-no-reading sentinel and the status falls back to
+            # standby. Holding the last colour here would leave the dashboard asserting
+            # "autonomous" about a boat that went silent — the one reading that must
+            # never outlive its evidence.
+            if self._last_led_state > 0 and (now - self._last_led_state) > _STALE_THRESHOLD_S:
+                self._state["led"]["alpha"] = 0.0
+                self._state["planning"]["status"] = "standby"
+                self._state["task"]["data"]["status"] = "standby"
+                _append_log(log_list, "WARNING: LED status lost.")
+                self._last_led_state = now
 
             if self._last_zed_odom > 0 and (now - self._last_zed_odom) > _STALE_THRESHOLD_S:
                 _append_log(log_list, "WARNING: ZED odometry lost.")

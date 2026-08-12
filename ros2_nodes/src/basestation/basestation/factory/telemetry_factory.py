@@ -22,15 +22,41 @@ log = logging.getLogger(__name__)
 # never assigns on its own).
 _TASK_STATUSES = ["standby", "autonomous", "remote"]
 
+# The mast lamp each status would be showing, as (red, green) channels in 0..1.
+# Mirrors Loon-E motor.py's set_led: autonomy engaged lights green alone, e-stop
+# pulled lights red alone, and anything else lights both (amber). Factory mode drives
+# this in step with the status it picks so the web client — which derives the mode
+# from the LAMP, not from planning.status — sees the two agree. Without it the
+# factory would cycle a status the dashboard ignores while the lamp stayed dark.
+_STATUS_TO_LED = {
+    "standby": (1.0, 1.0),
+    "remote": (1.0, 1.0),
+    "autonomous": (0.0, 1.0),
+    "out of control": (1.0, 0.0),
+}
+
+
+def _apply_status(state: dict, status: str) -> None:
+    """Set the task/planning status and the lamp that would be signalling it."""
+    state["planning"]["status"] = status
+    state["task"]["data"]["status"] = status
+    red, green = _STATUS_TO_LED.get(status, (1.0, 1.0))
+    state["led"]["red"] = red
+    state["led"]["green"] = green
+    state["led"]["blue"] = 0.0
+    # Raised because factory mode IS reporting a lamp — see make_default_state for
+    # why alpha is a has-a-reading flag rather than an opacity.
+    state["led"]["alpha"] = 1.0
+
 _LOG_MESSAGES = [
-    "Heartbeat OK",
-    "GPS fix acquired",
-    "Waypoint reached",
-    "Adjusting heading to course",
-    "Battery nominal",
-    "ZED odometry synced",
-    "Obstacle cleared",
-    "Holding station",
+    "Quack! Quack!",
+    "I am a Electronic Loon :)",
+    "Where am I?",
+    "What am I?",
+    "Who am I?",
+    "[Insert Loon Noises]",
+    "This is an example log",
+    "Yippie",
 ]
 
 # How often the factory thread mutates the shared state, in seconds.
@@ -125,8 +151,21 @@ def make_default_state() -> dict:
             "longitude": 0.0,
             "latitude": 0.0,
         },
+        # The vessel's physical status light, from the `led` topic (std_msgs/ColorRGBA).
+        # Channels are 0..1 floats, NOT 0..255 — the client renders them as-is.
+        #
+        # `alpha` is a has-a-reading flag rather than an opacity: the client treats 0 as
+        # "the boat has never reported its light" and falls back to planning.status, so
+        # this must stay 0 here and only be raised by _on_led. Sending a black lamp with
+        # alpha 1 would tell the dashboard the light is off, which is a different claim.
+        "led": {
+            "red": 0.0,
+            "green": 0.0,
+            "blue": 0.0,
+            "alpha": 0.0,
+        },
         "signal": {
-            "strength": 100.0,
+            "strength": 0.0, # default should be 0
         },
         "zed": {
             "odom": {
@@ -446,13 +485,15 @@ def _randomize_initial(state: dict) -> None:
     state["task"]["location"]["latitude"] = state["asv"]["latitude"]
     state["task"]["location"]["longitude"] = state["asv"]["longitude"]
     state["rudder"]["angle"] = random.uniform(-10, 10)
-    state["motors"]["left"] = random.uniform(40, 90)
-    state["motors"]["right"] = random.uniform(40, 90)
+    # Signed thruster power: -100 full astern, 0 stopped, +100 full ahead. Mirrors
+    # what _on_motor_state derives from the propeller servo fractions, so factory
+    # mode exercises the same range the live bridge produces (reverse included).
+    state["motors"]["left"] = random.uniform(-100, 100)
+    state["motors"]["right"] = random.uniform(-100, 100)
     state["battery"]["motors"] = random.uniform(60, 100)
     state["battery"]["primary"] = random.uniform(60, 100)
     state["signal"]["strength"] = random.uniform(80, 100)
-    state["planning"]["status"] = random.choice(_TASK_STATUSES)
-    state["task"]["data"]["status"] = state["planning"]["status"]
+    _apply_status(state, random.choice(_TASK_STATUSES))
     _append_log(state["task"]["log"], "[FACTORY] Factory telemetry stream started.")
 
 
@@ -584,8 +625,9 @@ def _tick(state: dict, field: dict | None = None) -> None:
 
     state["rudder"]["angle"] = _clamp(state["rudder"]["angle"] + _step(1.0, 5.0), -45.0, 45.0)
 
-    state["motors"]["left"] = _clamp(state["motors"]["left"] + _step(0.5, 3.0), 0.0, 100.0)
-    state["motors"]["right"] = _clamp(state["motors"]["right"] + _step(0.5, 3.0), 0.0, 100.0)
+    # Signed — see _randomize_initial. The walk is free to cross zero into astern.
+    state["motors"]["left"] = _clamp(state["motors"]["left"] + _step(0.5, 3.0), -100.0, 100.0)
+    state["motors"]["right"] = _clamp(state["motors"]["right"] + _step(0.5, 3.0), -100.0, 100.0)
 
     # Batteries drift downward (a slow discharge), everything else random-walks.
     state["battery"]["motors"] = _clamp(state["battery"]["motors"] - random.uniform(0.0, 0.05), 0.0, 100.0)
@@ -606,8 +648,7 @@ def _tick(state: dict, field: dict | None = None) -> None:
         state["map"]["vesselPose"] = _board_pose(state, field["origin_lat"], field["origin_lon"])
 
     if random.random() < 0.05:
-        state["planning"]["status"] = random.choice(_TASK_STATUSES)
-        state["task"]["data"]["status"] = state["planning"]["status"]
+        _apply_status(state, random.choice(_TASK_STATUSES))
 
     if random.random() < 0.2:
         _append_log(state["task"]["log"], f"[FACTORY] {random.choice(_LOG_MESSAGES)}")

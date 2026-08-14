@@ -265,13 +265,73 @@ def _live_video_frames():
             continue
         time.sleep(_VIDEO_POLL_S)
 
+# How long the live buffer may go without a new frame before the stream cuts to the
+# local clip. Long enough to ride out a link hiccup or a camera driver restart, short
+# enough that a dead feed doesn't sit frozen on its last frame for a whole run.
+_LIVE_STALL_TIMEOUT_S = 15.0
+
+
+def _live_video_with_backup():
+    """
+    Streams the latest JPEG frame from the ROS2 bridge / annotated_udp_stream buffer.
+    same as _live_video_frames, but if there is nothing for 15 seconds switch to backup
+
+    MJPEG has no way to say "nothing here": a stalled feed just stops delivering parts,
+    which the browser renders as the last good frame held indefinitely — visually
+    identical to a live but static scene. Cutting to the fallback clip is therefore the
+    signal to the operator that the camera is gone, not merely a nicer placeholder.
+
+    The switch is not one-way. The live buffer keeps being polled between fallback
+    frames, so the stream returns to it on the first frame the ASV publishes; the clip's
+    own frame interval paces that polling, capping the delay at ~1/fps.
+    """
+    last_id = None
+    last_frame_at = time.monotonic()
+    backup = None
+    try:
+        while True:
+            frame, frame_id = ros2_bridge.get_latest_frame_with_id()
+            if frame is not None and frame_id != last_id:
+                last_id = frame_id
+                last_frame_at = time.monotonic()
+                if backup is not None:
+                    logging.info("Live video recovered — leaving the fallback clip.")
+                    backup.close()  # runs its finally, releasing the VideoCapture
+                    backup = None
+                yield (
+                    b"--frame\r\n"
+                    b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
+                )
+                continue
+
+            # Still inside the grace window: keep polling and send nothing, exactly as
+            # _live_video_frames does — a brief gap shouldn't flap the stream over.
+            if time.monotonic() - last_frame_at < _LIVE_STALL_TIMEOUT_S:
+                time.sleep(_VIDEO_POLL_S)
+                continue
+
+            if backup is None:
+                logging.warning(
+                    "No live video frame for %.0fs — falling back to the local clip.",
+                    _LIVE_STALL_TIMEOUT_S,
+                )
+                backup = _fallback_video_frames()
+            # next() sleeps out the clip's frame interval internally, so it doubles as
+            # this loop's pacing while stalled — no extra sleep needed here.
+            yield next(backup)
+    finally:
+        # The client disconnecting throws GeneratorExit in at a yield above; without this
+        # the fallback clip's capture would leak until the generator was collected.
+        if backup is not None:
+            backup.close()
+
 
 @app.route("/video_feed")
 def video_feed():
     # In factory mode there's no real camera behind ros2_bridge (its thread was never
     # started), so always use the looped fallback clip even if rclpy itself is importable.
     use_live = ros2_bridge.is_ros2_available() and not FACTORY_MODE
-    frames = _live_video_frames() if use_live else _fallback_video_frames()
+    frames = _live_video_with_backup() if use_live else _fallback_video_frames()
     r = Response(frames, mimetype="multipart/x-mixed-replace; boundary=frame")
     r.headers["Access-Control-Allow-Origin"] = "*"
     return r

@@ -256,11 +256,11 @@ rclpy.shutdown()
 
 | Topic | Type | Populates |
 | --- | --- | --- |
-| `phone` | `std_msgs/Float32MultiArray` `[lat, lon, speed, heading]` | `asv.*`, `task.location`, `signal.strength` |
+| `phone` | `std_msgs/Float32MultiArray` `[lat, lon, speed, heading]` (no publisher since the phone was removed from the boat; the only source of latitude/longitude until a GPS sensor replaces it) | `asv.*`, `task.location`, `signal.strength` |
 | `task` | `std_msgs/Float32MultiArray` `[action, target_heading, target_speed]` | `planning.status`, `task.data.status`, `task.log` |
 | `/asv/joint_states` | `sensor_msgs/JointState` | `motors.left/right`, `rudder.angle` |
-| `battery_status/prop_l`, `battery_status/prop_r`, `battery_status/main` | `sensor_msgs/BatteryState` | `battery.motors` (avg of prop_l/prop_r), `battery.primary` (main) |
-| `zed/zed_node/odom` | `nav_msgs/Odometry` | `zed.odom` |
+| `battery_status/prop_l`, `battery_status/prop_r`, `battery_status/main` | `sensor_msgs/BatteryState` | `battery.motors` (avg of prop_l/prop_r), `battery.primary` (main), `battery.sensorConnected` (false on `present=False`, or once stale) |
+| `/zedx/zed_node/odom` | `nav_msgs/Odometry` | `zed.odom`, `asv.speed`, `asv.heading` (relative to where the camera started, not north), `signal.strength` |
 | `/zed/zed_node/rgb/color/rect/image` | `sensor_msgs/Image` | `zed.camera`, live video frames |
 | `zed/obj_det/objects` | `zed_msgs/ObjectsStamped` (optional — skipped if `zed_msgs` isn't built/sourced, see above) | `zed.objects` |
 | `/rosout` | `rcl_interfaces/Log` | `task.log` (INFO and above) |

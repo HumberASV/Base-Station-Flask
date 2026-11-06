@@ -187,7 +187,7 @@ def get_latest_frame_with_id() -> tuple:
 PHONE_TOPIC = "phone"
 TASK_TOPIC = "task"
 JOINT_STATES_TOPIC = "/asv/joint_states"
-ZED_ODOM_TOPIC = "odom"
+ZED_ODOM_TOPIC = "/zedx/zed_node/odom"
 ZED_IMAGE_TOPIC = "/zedx/zed_node/rgb/color/rect/image/compressed"
 ZED_OBJECTS_TOPIC = "zedx/zed_node/obj_det/objects"
 # Fully-qualified name of the ZED wrapper node, used only to ask it what resolution its
@@ -435,14 +435,14 @@ def _occupancy_grid_to_cells(msg) -> tuple:
     }
     return grid, info
 
-# Servo-fraction -> degrees mapping for the rudder (sensor_msgs/JointState.position
-# on JOINT_STATES_TOPIC is a fraction in [0, 1], not a real angle — see busio_node.py /
-# thrust_mixer.py). RUDDER_CENTER_FRACTION mirrors thrust_mixer's `rudder_center`
-# parameter default (0.55 = straight ahead). RUDDER_MAX_DEG mirrors the maxRudderDeg=90
-# prop the website passes to ShipRudderVisualizerPanel. This is an approximation —
-# there is no real servo-fraction-to-degree calibration anywhere in the codebase yet;
-# it needs tuning against the actual rudder throw once on the water.
-RUDDER_CENTER_FRACTION = 0.55
+# Servo-fraction -> degrees mapping for the rudder (index 2 of MOTOR_STATE_TOPIC is a
+# fraction in [0, 1], not a real angle). RUDDER_CENTER_FRACTION mirrors `center` in
+# Loon-E's config.yaml and the neutral placeholder hardware_node publishes while the
+# rudder servo is disconnected (0.5 = straight ahead). RUDDER_MAX_DEG mirrors the
+# maxRudderDeg=90 prop the website passes to ShipRudderVisualizerPanel. This is an
+# approximation — there is no real servo-fraction-to-degree calibration anywhere in the
+# codebase yet; it needs tuning against the actual rudder throw once on the water.
+RUDDER_CENTER_FRACTION = 0.5
 RUDDER_MAX_DEG = 90.0
 
 # Threshold in seconds for staleness detection of ASV topics. If a topic hasn't
@@ -548,6 +548,20 @@ def _quat_to_rpy(x: float, y: float, z: float, w: float): #-> tuple[float, float
     yaw = math.atan2(siny_cosp, cosy_cosp)
 
     return roll, pitch, yaw
+
+
+def _yaw_to_heading(yaw: float) -> float:
+    """
+    Convert an ENU yaw to the heading convention every heading on the wire uses.
+
+    ENU yaw is measured counter-clockwise from +x (east), in radians. A heading is
+    measured clockwise from north, in degrees [0, 360).
+
+    Only as absolute as the frame the yaw came from: the ZED's odom frame starts wherever
+    the camera started, so a heading derived from it is relative to that until something
+    anchors the frame to north.
+    """
+    return (90.0 - math.degrees(yaw)) % 360.0
 
 
 def _rudder_fraction_to_deg(fraction: float) -> float:
@@ -964,6 +978,10 @@ class _BaseStationNode(Node):
         self._last_zed_objects = 0.0
         #self._last_joint_states = 0.0
         self._last_motor_state = 0.0
+        self._last_battery = 0.0
+        # Latest message from anything that publishes steadily while the ASV is up. Drives
+        # signal strength — see _mark_link_alive.
+        self._last_link = 0.0
         self._last_map = 0.0
         self._last_scan = 0.0
         self._last_pose = 0.0
@@ -1102,28 +1120,72 @@ class _BaseStationNode(Node):
         if pcts:
             self._state["battery"]["motors"] = sum(pcts) / len(pcts)
 
+    def _read_battery(self, msg, name: str) -> "float | None":
+        """
+        Records whether a BatteryState carries a reading, and returns its percentage.
+
+        Loon-E publishes present=False with NaN measurements when it can't read the
+        battery sensor. Those must stop here: NaN isn't valid JSON, so one reaching the
+        state would make the web client fail to parse every frame after it.
+
+        Returns:
+            The battery's percentage (0-100), or None if there's no reading.
+        """
+        if not msg.present or math.isnan(msg.percentage):
+            # Nothing further to go stale, and the client already shows the failure.
+            self._last_battery = 0.0
+            with self._lock:
+                if self._state["battery"]["sensorConnected"]:
+                    _append_log(self._state["task"]["log"],
+                                "WARNING: Battery sensor not responding.")
+                self._state["battery"]["sensorConnected"] = False
+            return None
+
+        pct = msg.percentage * 100.0
+        log.debug("[Battery/%s] voltage=%.2fV percentage=%.1f%%", name, msg.voltage, pct)
+        self._last_battery = time.monotonic()
+        with self._lock:
+            self._state["battery"]["sensorConnected"] = True
+        return pct
+
     def _on_battery_prop_l(self, msg):
         """Callback for the left propulsion (Dewalt) battery."""
-        pct = msg.percentage * 100.0
-        log.debug("[Battery/prop_l] voltage=%.2fV percentage=%.1f%%", msg.voltage, pct)
+        pct = self._read_battery(msg, "prop_l")
+        if pct is None:
+            return
         with self._lock:
             self._last_prop_l_pct = pct
             self._update_motors_battery()
 
     def _on_battery_prop_r(self, msg):
         """Callback for the right propulsion (Dewalt) battery."""
-        pct = msg.percentage * 100.0
-        log.debug("[Battery/prop_r] voltage=%.2fV percentage=%.1f%%", msg.voltage, pct)
+        pct = self._read_battery(msg, "prop_r")
+        if pct is None:
+            return
         with self._lock:
             self._last_prop_r_pct = pct
             self._update_motors_battery()
 
     def _on_battery_main(self, msg):
         """Callback for the primary (Blue Robotics) battery."""
-        pct = msg.percentage * 100.0
-        log.debug("[Battery/main] voltage=%.2fV percentage=%.1f%%", msg.voltage, pct)
+        pct = self._read_battery(msg, "main")
+        if pct is None:
+            return
         with self._lock:
             self._state["battery"]["primary"] = pct
+
+    def _mark_link_alive(self) -> None:
+        """
+        Records that the ASV is reachable, which is what signal strength reports.
+
+        Only the `phone` topic used to do this, and the phone has been removed from the
+        boat, so nothing else would ever raise the reading from 0. Called from topics
+        that publish steadily whenever the boat is up; there's no measured radio strength
+        behind this, so it's all-or-nothing.
+        """
+        self._last_link = time.monotonic()
+        with self._lock:
+            self._state["signal"]["strength"] = 100.0
 
 
     def _on_motor_state(self, msg):
@@ -1167,6 +1229,7 @@ class _BaseStationNode(Node):
         """
         # Liveness first, and unconditionally — a blinking lamp is a healthy lamp.
         self._last_led_state = time.monotonic()
+        self._mark_link_alive()
 
         red, green, blue = float(msg.r), float(msg.g), float(msg.b)
         if max(red, green, blue) <= _LED_CHANNEL_ON_THRESHOLD:
@@ -1272,12 +1335,17 @@ class _BaseStationNode(Node):
     def _on_zed_odom(self, msg):
         """
         Callback for handling incoming ZED odometry messages.
+
+        Also the source of the vessel's speed and heading now that the phone is gone.
+        See _yaw_to_heading for what that heading is relative to.
         """
         p = msg.pose.pose.position
         o = msg.pose.pose.orientation
+        v = msg.twist.twist.linear
         roll, pitch, yaw = _quat_to_rpy(o.x, o.y, o.z, o.w)
         log.debug("[ZED/odom] pos=(%.3f, %.3f, %.3f) rpy=(%.1f°, %.1f°, %.1f°)",
                   p.x, p.y, p.z, math.degrees(roll), math.degrees(pitch), math.degrees(yaw))
+        self._mark_link_alive()
         with self._lock:
             zed = self._state["zed"]["odom"]
             zed["position"] = {"x": float(p.x), "y": float(p.y), "z": float(p.z)}
@@ -1286,6 +1354,9 @@ class _BaseStationNode(Node):
                 "pitch": math.degrees(pitch),
                 "yaw": math.degrees(yaw),
             }
+            # Horizontal only: a boat bobbing on the spot isn't making way.
+            self._state["asv"]["speed"] = math.hypot(float(v.x), float(v.y))
+            self._state["asv"]["heading"] = _yaw_to_heading(yaw)
         self._last_zed_odom = time.monotonic()
 
     # ------------------------------------------------------------------
@@ -1738,9 +1809,7 @@ class _BaseStationNode(Node):
         t = tf.transform.translation
         r = tf.transform.rotation
         _roll, _pitch, yaw = _quat_to_rpy(r.x, r.y, r.z, r.w)
-        # Map frame is ENU: yaw is counter-clockwise from +x (east). Every heading on the
-        # wire is a compass bearing: clockwise from north.
-        heading = (90.0 - math.degrees(yaw)) % 360.0
+        heading = _yaw_to_heading(yaw)
 
         with self._lock:
             self._state["map"]["vesselPose"] = {
@@ -1810,7 +1879,34 @@ class _BaseStationNode(Node):
 
             if self._last_zed_odom > 0 and (now - self._last_zed_odom) > _STALE_THRESHOLD_S:
                 _append_log(log_list, "WARNING: ZED odometry lost.")
+                # A frozen speed reads as the boat still making way. Heading is left alone,
+                # since a boat that has stopped reporting still points somewhere.
+                self._state["asv"]["speed"] = 0.0
                 self._last_zed_odom = now
+
+            # Thruster readings, like the pose below, must not outlive their evidence.
+            # Timer cleared rather than reset so this fires once per outage, not every
+            # threshold: the values are already zero and the warning has been logged.
+            if self._last_motor_state > 0 and (now - self._last_motor_state) > _STALE_THRESHOLD_S:
+                self._state["motors"]["left"] = 0.0
+                self._state["motors"]["right"] = 0.0
+                self._state["rudder"]["angle"] = 0.0
+                _append_log(log_list, "WARNING: Motor state lost.")
+                self._last_motor_state = 0.0
+
+            # The percentages are left as they were: the client hides them behind its
+            # failure view while sensorConnected is false, and a zero here would claim
+            # the batteries were flat.
+            if self._last_battery > 0 and (now - self._last_battery) > _STALE_THRESHOLD_S:
+                self._state["battery"]["sensorConnected"] = False
+                _append_log(log_list, "WARNING: Battery telemetry lost.")
+                self._last_battery = 0.0
+
+            # Nothing steady has arrived, so the boat is out of reach.
+            if self._last_link > 0 and (now - self._last_link) > _STALE_THRESHOLD_S:
+                self._state["signal"]["strength"] = 0.0
+                _append_log(log_list, "WARNING: ASV telemetry lost.")
+                self._last_link = 0.0
 
             # Detections are cleared rather than preserved, for the same reason the pose
             # below is nulled: boxes left burned onto the video read as current.

@@ -140,6 +140,9 @@ def make_default_state() -> dict:
         "battery": {
             "motors": 0.0,
             "primary": 0.0,
+            # False until a real reading arrives, since 0% would claim the batteries are
+            # flat. The client shows a sensor failure instead of percentages while false.
+            "sensorConnected": False,
         },
         "motors": {
             "left": 0.0,
@@ -492,6 +495,7 @@ def _randomize_initial(state: dict) -> None:
     state["motors"]["right"] = random.uniform(-100, 100)
     state["battery"]["motors"] = random.uniform(60, 100)
     state["battery"]["primary"] = random.uniform(60, 100)
+    state["battery"]["sensorConnected"] = True
     state["signal"]["strength"] = random.uniform(80, 100)
     _apply_status(state, random.choice(_TASK_STATUSES))
     _append_log(state["task"]["log"], "[FACTORY] Factory telemetry stream started.")

@@ -1597,8 +1597,14 @@ class _BaseStationNode(Node):
                     # obj.position is zed_msgs/Object's fixed-size `float32[3]` field,
                     # which rosidl generates as a bare numpy.ndarray (no .x/.y/.z) —
                     # index it instead of attribute-accessing it.
-                    "x": float(obj.position[0]),
-                    "y": float(obj.position[1]),
+                    #
+                    # The ZED wrapper reports it in REP-103 camera axes (x forward,
+                    # y left, z up), but the wire convention — and the factory's
+                    # _visible_objects, and every client consumer — is boat-relative
+                    # x = right/starboard, y = forward. Passing it through unconverted
+                    # put detections 90° off around the boat.
+                    "x": -float(obj.position[1]),
+                    "y": float(obj.position[0]),
                     "z": float(obj.position[2]),
                 },
             }

@@ -52,12 +52,22 @@ parser.add_argument(
          "flag on the CLI, or with an explicit true/false value (used by the launch file).",
 )
 
+parser.add_argument(
+    "--telemetry-hz",
+    type=float,
+    default=float(os.getenv("TELEMETRY_HZ", "20")),
+    help="Target rate of the /telemetry WebSocket stream, in frames per second (default: 20, "
+         "clamped to 1-60). Lower it on a weak link; the ZED odometry it carries updates at "
+         "camera rate, so much above ~30 just resends unchanged state.",
+)
+
 args, _ = parser.parse_known_args()  # ignore --ros-args etc. injected by `ros2 launch`
 
 HOST = args.host
 PORT = args.port
 DASHBOARD_MODE = args.dashboard
 FACTORY_MODE = _truthy(args.factory)
+TELEMETRY_HZ = min(60.0, max(1.0, args.telemetry_hz))
 
 # Check if the provided host and port are valid
 if not validate_host_port(HOST, str(PORT)):
@@ -151,8 +161,10 @@ def health():
 # WebSocket — telemetry stream
 # ---------------------------------------------------------------------------
 
+logging.info("Telemetry WebSocket target rate: %.1f Hz", TELEMETRY_HZ)
+
 # Keys under `map` that are large and change rarely, so they are sent only when the map
-# actually changes rather than ~7x/second with everything else. `info` rides along because
+# actually changes rather than TELEMETRY_HZ times a second with everything else. `info` rides along because
 # `info.known` is a cols x rows boolean mask that changes with the grid.
 _HEAVY_MAP_KEYS = ("occupancyGrid", "navigationGrid", "info")
 
@@ -166,8 +178,8 @@ def _serialise_state(state: dict, include_map: bool) -> str:
     leaves the stored value untouched. The copies below are shallow and touch only the
     `map` sub-dict, so this costs nothing next to the json.dumps it shrinks.
 
-    `separators` drops json.dumps' default `", "` / `": "` padding. On a payload sent ~10
-    times a second that whitespace is pure overhead — nothing downstream reads the JSON
+    `separators` drops json.dumps' default `", "` / `": "` padding. On a payload sent
+    TELEMETRY_HZ times a second that whitespace is pure overhead — nothing downstream reads the JSON
     by eye, and JSON.parse does not care.
     """
     if include_map:
@@ -180,7 +192,14 @@ def _serialise_state(state: dict, include_map: bool) -> str:
 @sock.route("/telemetry")
 def telemetry_ws(ws):
     """
-    Streams telemetry at ~10 Hz, re-sending the occupancy map only when it changes.
+    Streams telemetry at TELEMETRY_HZ, re-sending the occupancy map only when it changes.
+
+    Paced to a deadline rather than a fixed sleep. It used to `sleep(0.1)` after each
+    send, so the period was 100 ms *plus* the serialise and send time — the stream never
+    reached the 10 Hz it claimed and the client measured ~9. Now each send is scheduled
+    `period` after the previous deadline, so the work comes out of the interval instead
+    of being added to it. If a send overruns (slow Wi-Fi), the schedule resets to now
+    rather than firing a catch-up burst of back-to-back frames.
 
     This loop used to re-serialise the ENTIRE state on every tick, so the grid's size
     multiplied straight into continuous bandwidth — which is what forced ros2_bridge to
@@ -196,6 +215,8 @@ def telemetry_ws(ws):
     """
     last_grid = None
     first = True
+    period = 1.0 / TELEMETRY_HZ
+    next_send = time.monotonic()
     try:
         while True:
             with _state_lock:
@@ -208,7 +229,12 @@ def telemetry_ws(ws):
             if include_map:
                 last_grid = grid
                 first = False
-            time.sleep(0.1)
+            next_send += period
+            delay = next_send - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+            else:
+                next_send = time.monotonic()
     except Exception:
         pass
 

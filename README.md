@@ -168,6 +168,7 @@ Command-line flags (all optional):
 | `--port` | `8080` (or `$env:PORT`) | Port to bind |
 | `--dashboard` | off | Enables the `/dashboard` debug page |
 | `--factory` | off (or `$env:FACTORY_MODE`) | Streams factory (fake) telemetry instead of connecting to ROS2/the ASV — see below |
+| `--telemetry-hz` | `20` (or `$env:TELEMETRY_HZ`) | Target rate of the `/telemetry` WebSocket, clamped to 1–60. Lower it on a weak link. |
 
 Environment variables:
 
@@ -177,6 +178,7 @@ Environment variables:
 | `FLASK_DEBUG=1` | Enables Flask's interactive debugger + reloader and `DEBUG`-level logging. **Never use in production** — it allows arbitrary code execution. |
 | `SECRET_KEY` | Flask session secret (defaults to a placeholder — set a real value for anything beyond local dev) |
 | `FACTORY_MODE=1` | Fallback for `--factory` if the flag isn't passed |
+| `TELEMETRY_HZ` | Fallback for `--telemetry-hz` if the flag isn't passed |
 | `MAP_FRAME` / `BASE_FRAME` | TF frames the vessel pose is looked up between (default `map` / `base_link`) |
 | `DRAW_DETECTIONS=0` | Disables the object-detection overlay. The bridge then forwards ZED frames byte for byte instead of decoding and re-encoding them (~10-30 ms/frame), so this is also the way to measure the overlay's latency cost. |
 | `DETECTION_MIN_CONFIDENCE` | Extra confidence floor for drawn boxes, on top of the ZED's own per-class thresholds (default `0.0`, i.e. draw everything that arrives) |
